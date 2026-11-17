@@ -38,6 +38,7 @@ pub enum TowerError {
     FloorSegmentAlreadyExists { floor: i32, column: u32 },
     FloorSegmentUnsupported { floor: i32, column: u32 },
     FloorSegmentOverlapsElevator { floor: i32, column: u32 },
+    LobbyOnlyAllowedOnEveryFifteenthFloor { floor: i32 },
     RoomOverlap(RoomId),
     ElevatorOverlap { column: u32 },
     InvalidElevatorFloorRange { start_floor: i32, end_floor: i32 },
@@ -149,6 +150,13 @@ impl Tower {
             .iter()
             .position(|floor| floor.number == floor_number)
             .ok_or(TowerError::FloorNotFound(floor_number))?;
+
+        // Lobby only on ground floor and every 15th floor
+        if room_type == RoomType::Lobby && (floor_number < 0 || floor_number % 15 != 0) {
+            return Err(TowerError::LobbyOnlyAllowedOnEveryFifteenthFloor {
+                floor: floor_number,
+            });
+        }
 
         let width = room_type.properties().width;
         // Use a right-exclusive edge to match the overlap check below.
@@ -444,13 +452,31 @@ mod tests {
     }
 
     #[test]
+    fn lobbies_are_allowed_on_ground_and_every_fifteenth_floor_above_it() {
+        let mut tower = Tower::default();
+        assert!(tower.build_room(0, 0, RoomType::Lobby).is_ok());
+
+        assert!(matches!(
+            tower.build_room(1, 0, RoomType::Lobby),
+            Err(TowerError::LobbyOnlyAllowedOnEveryFifteenthFloor { floor: 1 })
+        ));
+        assert!(matches!(
+            tower.build_room(-1, 0, RoomType::Lobby),
+            Err(TowerError::LobbyOnlyAllowedOnEveryFifteenthFloor { floor: -1 })
+        ));
+
+        build_supported_segments(&mut tower, 15, 1..2);
+        assert!(tower.build_room(15, 1, RoomType::Lobby).is_ok());
+        build_supported_segments(&mut tower, 30, 2..3);
+        assert!(tower.build_room(30, 2, RoomType::Lobby).is_ok());
+    }
+
+    #[test]
     fn room_can_auto_build_floor_segments_supported_by_a_room_below() {
         let mut tower = Tower::default();
+        build_supported_segments(&mut tower, 0, 8..32);
         tower
-            .build_floor_segment(0, 8)
-            .expect("ground floor is the foundation");
-        tower
-            .build_room(0, 8, RoomType::Lobby)
+            .build_room(0, 8, RoomType::PartyHall)
             .expect("room should build on its floor segment");
         let ground_floor = tower
             .floors
@@ -461,7 +487,7 @@ mod tests {
         ground_floor.floor_segments.clear();
 
         tower
-            .build_room(1, 8, RoomType::Lobby)
+            .build_room(1, 8, RoomType::Office)
             .expect("room below should support the automatically added segment");
         assert!(
             tower
@@ -556,7 +582,15 @@ mod tests {
         ));
         for floor in [-1, 0, 1] {
             assert!(matches!(
-                tower.build_room(floor, 12, RoomType::Lobby),
+                tower.build_room(
+                    floor,
+                    12,
+                    match floor {
+                        -1 => RoomType::Condo,
+                        0 => RoomType::Lobby,
+                        _ => RoomType::Office,
+                    }
+                ),
                 Err(TowerError::ElevatorOverlap { column: 12 })
             ));
         }
