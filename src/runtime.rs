@@ -26,7 +26,7 @@ pub fn run() {
     let worker_state = Arc::clone(&game_state);
     let worker_to_renderer = worker_to_renderer_sender.clone();
     let worker_to_simulation = speed_request_sender;
-    let _worker_thread = thread::spawn(move || {
+    let worker_thread = thread::spawn(move || {
         worker::run(
             renderer_to_worker_receiver,
             worker_state,
@@ -35,17 +35,16 @@ pub fn run() {
         )
     });
 
-    // The renderer consumes both worker updates and simulation ticks.
-    let _renderer_thread = thread::spawn(move || {
-        renderer::run(
-            renderer_to_worker_sender,
-            worker_to_renderer_receiver,
-            simulation_to_renderer_receiver,
-        )
-    });
+    // Bevy's window event loop must run on the main thread on macOS.
+    renderer::run(
+        renderer_to_worker_sender,
+        worker_to_renderer_receiver,
+        simulation_to_renderer_receiver,
+    );
 
-    // Keep the runtime alive for as long as the simulation loop is running.
+    // Renderer exit signals the worker, which disconnects the simulation speed channel.
     simulation_thread
         .join()
         .expect("simulation thread panicked");
+    worker_thread.join().expect("worker thread panicked");
 }

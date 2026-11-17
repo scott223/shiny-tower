@@ -10,9 +10,12 @@ pub enum RendererWorkerMessage {
     RoomBuilt {
         id: RoomId,
         floor: i32,
+        /// Leftmost column occupied by the room.
         x: u32,
         room_type: RoomType,
     },
+    /// Sent when a room build request could not be completed.
+    RoomBuildFailed { error: String },
     /// Sent by the worker after it successfully builds a floor segment.
     FloorSegmentBuilt { floor: i32, column: u32 },
     /// Sent by the worker after it successfully destroys a room.
@@ -29,7 +32,7 @@ pub enum UiInput {
     /// Request a room be built on a floor.
     BuildRoom {
         floor: i32,
-        /// The room's column position on the floor.
+        /// Leftmost column occupied by the room.
         x: u32,
         room_type: RoomType,
     },

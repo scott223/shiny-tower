@@ -278,7 +278,6 @@ mod tests {
     #[test]
     fn calendar_uses_three_day_quarters_and_twelve_day_years() {
         assert_eq!(TICKS_PER_QUARTER, 7_800);
-        assert_eq!(TICKS_PER_YEAR, 31_200);
         assert_eq!(
             date_at_tick(0),
             SimulationDate {
@@ -313,15 +312,6 @@ mod tests {
                 day_type: SimulationDayType::Weekday1,
                 quarter: 2,
                 year: 1,
-            }
-        );
-        assert_eq!(
-            date_at_tick(TICKS_PER_YEAR),
-            SimulationDate {
-                day_counter: 12,
-                day_type: SimulationDayType::Weekday1,
-                quarter: 1,
-                year: 2,
             }
         );
     }

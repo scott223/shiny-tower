@@ -5,4 +5,4 @@ edition = "2024"
 
 [dependencies]
 slotmap = "1.0"
-# bevy = { version = "0.20.1", features = ["dynamic_linking"] }
+bevy = { version = "0.20.1", features = ["dynamic_linking"] }

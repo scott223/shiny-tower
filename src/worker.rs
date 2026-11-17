@@ -23,40 +23,43 @@ pub fn run(
             }) => {
                 // Keep cost validation, construction, and payment atomic with respect to other
                 // state users by doing them under the same lock.
-                let built_room = match game_state.lock() {
+                let build_result = match game_state.lock() {
                     Ok(mut state) => {
                         // Planning validates placement and counts only the floor segments that
                         // construction would need to add.
-                        let total_cost = match state.building.room_build_cost(floor, x, room_type) {
-                            Ok(cost) => cost,
+                        match state.building.room_build_cost(floor, x, room_type) {
                             Err(error) => {
                                 eprintln!("could not build room: {error:?}");
-                                // Invalid placements cannot be priced, so skip this request.
-                                continue;
+                                Err(format!("Could not build room: {error:?}"))
                             }
-                        };
-                        if state.economy.cash < total_cost {
-                            eprintln!(
-                                "insufficient cash to build room: need {total_cost}, have {}",
-                                state.economy.cash
-                            );
-                            None
-                        } else {
-                            // The plan has succeeded and funds are available; mutate the tower
-                            // first, then charge only after construction succeeds.
-                            match state.building.build_room(floor, x, room_type) {
-                                Ok(room_id) => {
-                                    state.economy.cash -= total_cost;
-                                    Some(RendererWorkerMessage::RoomBuilt {
-                                        id: room_id,
-                                        floor,
-                                        x,
-                                        room_type,
-                                    })
-                                }
-                                Err(error) => {
-                                    eprintln!("could not build room: {error:?}");
-                                    None
+                            Ok(total_cost) if state.economy.cash < total_cost => {
+                                let message = format!(
+                                    "Not enough cash: need ${total_cost}, have ${}",
+                                    state.economy.cash
+                                );
+                                eprintln!(
+                                    "insufficient cash to build room: need {total_cost}, have {}",
+                                    state.economy.cash
+                                );
+                                Err(message)
+                            }
+                            Ok(total_cost) => {
+                                // The plan has succeeded and funds are available; mutate the tower
+                                // first, then charge only after construction succeeds.
+                                match state.building.build_room(floor, x, room_type) {
+                                    Ok(room_id) => {
+                                        state.economy.cash -= total_cost;
+                                        Ok(RendererWorkerMessage::RoomBuilt {
+                                            id: room_id,
+                                            floor,
+                                            x,
+                                            room_type,
+                                        })
+                                    }
+                                    Err(error) => {
+                                        eprintln!("could not build room: {error:?}");
+                                        Err(format!("Could not build room: {error:?}"))
+                                    }
                                 }
                             }
                         }
@@ -64,12 +67,22 @@ pub fn run(
                     Err(error) => {
                         // A poisoned mutex means shared game state can no longer be trusted.
                         eprintln!("game state lock poisoned: {error}");
+                        send_message(
+                            &to_renderer,
+                            RendererWorkerMessage::RoomBuildFailed {
+                                error: format!("Game state is unavailable: {error}"),
+                            },
+                        );
                         break;
                     }
                 };
                 // Send only after releasing the game-state lock.
-                if let Some(message) = built_room {
-                    send_message(&to_renderer, message);
+                match build_result {
+                    Ok(message) => send_message(&to_renderer, message),
+                    Err(error) => send_message(
+                        &to_renderer,
+                        RendererWorkerMessage::RoomBuildFailed { error },
+                    ),
                 }
             }
             RendererWorkerMessage::UiInput(UiInput::BuildFloorSegment { floor, column }) => {
@@ -129,6 +142,7 @@ pub fn run(
                 }
             }
             RendererWorkerMessage::RoomBuilt { .. }
+            | RendererWorkerMessage::RoomBuildFailed { .. }
             | RendererWorkerMessage::FloorSegmentBuilt { .. }
             | RendererWorkerMessage::RoomRemoved(_) => {
                 // These variants are worker outputs, so receiving them here indicates a
@@ -280,6 +294,11 @@ mod tests {
         assert_eq!(state.lock().unwrap().economy.cash, 500);
         assert!(matches!(
             output_receiver.recv().unwrap(),
+            RendererWorkerMessage::RoomBuildFailed { error }
+                if error.contains("FloorSegmentUnsupported")
+        ));
+        assert!(matches!(
+            output_receiver.recv().unwrap(),
             RendererWorkerMessage::Shutdown
         ));
     }
@@ -326,6 +345,11 @@ mod tests {
         assert_eq!(state.economy.cash, 99);
         assert!(state.building.floors[11].rooms.is_empty());
         drop(state);
+        assert!(matches!(
+            output_receiver.recv().unwrap(),
+            RendererWorkerMessage::RoomBuildFailed { error }
+                if error.contains("need $100, have $99")
+        ));
         assert!(matches!(
             output_receiver.recv().unwrap(),
             RendererWorkerMessage::Shutdown
@@ -482,6 +506,11 @@ mod tests {
         assert_eq!(state.building.floors[11].floor_segments.len(), 15);
         assert!(state.building.floors[11].rooms.is_empty());
         drop(state);
+        assert!(matches!(
+            output.recv().unwrap(),
+            RendererWorkerMessage::RoomBuildFailed { error }
+                if error.contains("need $600, have $599")
+        ));
         assert!(matches!(
             output.recv().unwrap(),
             RendererWorkerMessage::Shutdown

@@ -66,7 +66,7 @@ impl RoomType {
 #[derive(Clone, Debug)]
 /// A room instance placed on a floor.
 pub struct Room {
-    /// Column position on the floor.
+    /// Leftmost column occupied by the room.
     pub x: u32,
     /// Kind of room, which defines its properties.
     pub room_type: RoomType,
