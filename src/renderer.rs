@@ -1,3 +1,4 @@
+//! Bevy scene, HUD, and input handling for the tower renderer.
 use crate::messages::{
     RendererWorkerMessage, SimulationDate, SimulationDayType, SimulationRendererMessage,
     SimulationSpeed, SimulationTime, TimeOfDayPeriod, UiInput,
@@ -14,14 +15,23 @@ use bevy::window::PrimaryWindow;
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
-// Tower positions are converted from columns/floors into these Bevy world-space units.
+// Tower positions are converted from columns and floors into these world-space units.
 const COLUMN_WIDTH: f32 = 8.0;
 const FLOOR_HEIGHT: f32 = 24.0;
-const FLOOR_THICKNESS: f32 = 6.0;
+const FLOOR_THICKNESS: f32 = 8.0;
+
+// Camera movement, depth, and zoom limits.
+const CAMERA_Z: f32 = 100.0;
 const CAMERA_SPEED: f32 = 700.0;
-const CAMERA_MIN_SCALE: f32 = 0.35;
+const CAMERA_START_SCALE: f32 = 0.35;
+const CAMERA_MIN_SCALE: f32 = 0.2;
 const CAMERA_MAX_SCALE: f32 = 3.0;
 const CAMERA_ZOOM_RATE: f32 = 1.2;
+const CAMERA_PAN_MIN_SPEED_FACTOR: f32 = 0.75;
+// Keep the initial view anchored near the uppermost underground floors.
+const INITIAL_UNDERGROUND_FLOORS: i32 = 2;
+
+// Fixed-screen HUD and tooltip layout.
 const HUD_HEIGHT: f32 = 78.0;
 const ROOM_MENU_LEFT: f32 = 12.0;
 const ROOM_MENU_TOP: f32 = 90.0;
@@ -30,7 +40,9 @@ const ROOM_MENU_HEIGHT: f32 = 220.0;
 const ERROR_TOOLTIP_WIDTH: f32 = 300.0;
 const ERROR_TOOLTIP_HEIGHT: f32 = 72.0;
 
-// std channels are not Sync; the mutex wrappers let Bevy store their receivers as a Resource.
+/// Message endpoints shared by renderer systems.
+///
+/// The mutexes make standard-library receivers usable as Bevy resources.
 #[derive(Resource)]
 struct RendererChannels {
     to_worker: Sender<RendererWorkerMessage>,
@@ -38,6 +50,7 @@ struct RendererChannels {
     from_simulation: Mutex<Receiver<SimulationRendererMessage>>,
 }
 
+/// Most recent simulation values displayed by the HUD.
 #[derive(Resource)]
 struct SimulationClock {
     tick: u64,
@@ -46,7 +59,7 @@ struct SimulationClock {
     cash: u64,
 }
 
-// This reflects the last speed request successfully queued for the simulation worker.
+/// Speed shown as active in the HUD, including the last queued speed before pausing.
 #[derive(Resource)]
 struct ActiveSpeed {
     current: SimulationSpeed,
@@ -54,6 +67,7 @@ struct ActiveSpeed {
 }
 
 impl ActiveSpeed {
+    /// Records a speed request after it was accepted by the worker channel.
     fn select(&mut self, speed: SimulationSpeed) {
         self.current = speed;
         if speed != SimulationSpeed::Paused {
@@ -61,6 +75,7 @@ impl ActiveSpeed {
         }
     }
 
+    /// Returns the speed that should be selected by the pause toggle.
     fn pause_toggle_target(&self) -> SimulationSpeed {
         if self.current == SimulationSpeed::Paused {
             self.last_running
@@ -70,6 +85,7 @@ impl ActiveSpeed {
     }
 }
 
+/// Current room selection and status of the in-flight placement request.
 #[derive(Resource, Default)]
 struct PlacementState {
     selected_room: Option<RoomType>,
@@ -79,6 +95,7 @@ struct PlacementState {
 }
 
 impl Default for SimulationClock {
+    /// Starts the HUD with the simulation's initial date, time, and funds.
     fn default() -> Self {
         Self {
             tick: 0,
@@ -98,24 +115,31 @@ impl Default for SimulationClock {
     }
 }
 
+/// Marks the camera used to render the tower world.
 #[derive(Component)]
 struct TowerCamera;
 
+/// Marks the text node that displays simulation status.
 #[derive(Component)]
 struct HudText;
 
+/// Associates a rendered room entity with its simulation identifier.
 #[derive(Component)]
 struct RoomVisual(RoomId);
 
+/// Stores the speed represented by a HUD speed button.
 #[derive(Component)]
 struct SpeedControlButton(SimulationSpeed);
 
+/// Stores the room type represented by a build-menu button.
 #[derive(Component)]
 struct RoomTypeButton(RoomType);
 
+/// Marks the sprite following the cursor during room placement.
 #[derive(Component)]
 struct PlacementPreview;
 
+/// Marks the UI node used to display room-placement errors.
 #[derive(Component)]
 struct PlacementErrorTooltip;
 
@@ -166,19 +190,20 @@ pub fn run(
     }
 }
 
+/// Creates the camera, tower backdrop, floor guides, and placement preview.
 fn setup_scene(mut commands: Commands, window: Single<&Window, With<PrimaryWindow>>) {
     let (map_min, map_max) = map_bounds();
     let tower_width = map_max.x;
-    let camera_start_y = map_min.y + window.height() * CAMERA_MIN_SCALE * 0.5;
+    let camera_start_y = initial_camera_y(window.height());
 
     // Floor zero starts at the world origin; positive floors extend upward.
     commands.spawn((
         Camera2d,
         Projection::Orthographic(OrthographicProjection {
-            scale: CAMERA_MIN_SCALE,
+            scale: CAMERA_START_SCALE,
             ..OrthographicProjection::default_2d()
         }),
-        Transform::from_xyz(tower_width * 0.5, camera_start_y, 1_000.0),
+        Transform::from_xyz(tower_width * 0.5, camera_start_y, CAMERA_Z),
         TowerCamera,
     ));
 
@@ -214,8 +239,10 @@ fn setup_scene(mut commands: Commands, window: Single<&Window, With<PrimaryWindo
     ));
 }
 
+/// Builds the fixed HUD, speed controls, room menu, and error tooltip.
 fn setup_hud(mut commands: Commands, channels: Res<RendererChannels>) {
     // The absolute-positioned translucent node stays fixed while the world camera moves.
+    // Add room selection controls below the top status bar.
     commands
         .spawn((
             Node {
@@ -351,6 +378,7 @@ fn setup_hud(mut commands: Commands, channels: Res<RendererChannels>) {
             }
         });
 
+    // Keep placement failures visible without blocking the tower view.
     commands.spawn((
         Text::new(""),
         TextFont::from_font_size(14.0),
@@ -370,6 +398,7 @@ fn setup_hud(mut commands: Commands, channels: Res<RendererChannels>) {
     ));
 }
 
+/// Applies keyboard and wheel movement, then keeps the view inside map bounds.
 fn move_camera(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -408,20 +437,30 @@ fn move_camera(
     }
 
     let (map_min, map_max) = map_bounds();
+    let cursor_position = window.cursor_position();
+    let viewport_size = window.size();
     for (mut transform, mut projection) in &mut cameras {
-        if direction != Vec3::ZERO {
-            // Normalize so diagonal movement is not faster; delta time keeps motion frame-rate independent.
-            transform.translation += direction.normalize() * CAMERA_SPEED * time.delta_secs();
-        }
-
         if let Projection::Orthographic(orthographic) = &mut *projection {
+            if direction != Vec3::ZERO {
+                // Normalize so diagonal movement is not faster; delta time keeps motion frame-rate independent.
+                let speed =
+                    CAMERA_SPEED * time.delta_secs() * camera_pan_speed_factor(orthographic.scale);
+                transform.translation += direction.normalize() * speed;
+            }
+
             if zoom_direction != 0.0 {
                 let zoom_factor = (CAMERA_ZOOM_RATE * time.delta_secs() * zoom_direction).exp();
-                orthographic.scale =
-                    (orthographic.scale * zoom_factor).clamp(CAMERA_MIN_SCALE, CAMERA_MAX_SCALE);
+                zoom_camera(
+                    &mut transform,
+                    orthographic,
+                    zoom_factor,
+                    cursor_position,
+                    viewport_size,
+                );
             }
             if scroll_delta != Vec2::ZERO {
-                let world_delta = scroll_delta * orthographic.scale;
+                let speed_factor = camera_pan_speed_factor(orthographic.scale);
+                let world_delta = scroll_delta * orthographic.scale * speed_factor;
                 transform.translation.x += world_delta.x;
                 transform.translation.y += world_delta.y;
             }
@@ -436,6 +475,38 @@ fn move_camera(
     }
 }
 
+/// Changes zoom while keeping the world point under the cursor stationary.
+fn zoom_camera(
+    transform: &mut Transform,
+    projection: &mut OrthographicProjection,
+    zoom_factor: f32,
+    cursor_position: Option<Vec2>,
+    viewport_size: Vec2,
+) {
+    let old_scale = projection.scale;
+    let new_scale = (old_scale * zoom_factor).clamp(CAMERA_MIN_SCALE, CAMERA_MAX_SCALE);
+
+    if let Some(cursor) = cursor_position {
+        let cursor_offset = Vec2::new(
+            cursor.x - viewport_size.x * 0.5,
+            viewport_size.y * 0.5 - cursor.y,
+        );
+        let world_anchor = transform.translation.truncate() + cursor_offset * old_scale;
+        transform.translation.x = world_anchor.x - cursor_offset.x * new_scale;
+        transform.translation.y = world_anchor.y - cursor_offset.y * new_scale;
+    }
+
+    projection.scale = new_scale;
+}
+
+/// Reduces keyboard and wheel panning speed slightly as the camera zooms in.
+fn camera_pan_speed_factor(scale: f32) -> f32 {
+    let zoom_progress =
+        ((scale - CAMERA_MIN_SCALE) / (CAMERA_MAX_SCALE - CAMERA_MIN_SCALE)).clamp(0.0, 1.0);
+    CAMERA_PAN_MIN_SPEED_FACTOR + (1.0 - CAMERA_PAN_MIN_SPEED_FACTOR) * zoom_progress
+}
+
+/// Toggles between paused simulation and the last running speed with Space.
 fn toggle_pause(
     keyboard: Res<ButtonInput<KeyCode>>,
     channels: Res<RendererChannels>,
@@ -453,6 +524,7 @@ fn toggle_pause(
     }
 }
 
+/// Returns the world-space rectangle occupied by the tower map.
 fn map_bounds() -> (Vec2, Vec2) {
     (
         Vec2::new(
@@ -466,6 +538,13 @@ fn map_bounds() -> (Vec2, Vec2) {
     )
 }
 
+/// Places the default-scale camera so its lower edge starts at the selected basement floors.
+fn initial_camera_y(window_height: f32) -> f32 {
+    let view_min_y = -(INITIAL_UNDERGROUND_FLOORS as f32) * FLOOR_HEIGHT - FLOOR_THICKNESS;
+    view_min_y + window_height * CAMERA_START_SCALE * 0.5
+}
+
+/// Limits zoom and camera position so the viewport remains within the tower map.
 fn clamp_camera_to_map(
     transform: &mut Transform,
     projection: &mut OrthographicProjection,
@@ -495,6 +574,7 @@ fn clamp_camera_to_map(
         .clamp(map_min.y + half_view.y, map_max.y - half_view.y);
 }
 
+/// Positions the cursor preview and sends a build request on click.
 fn update_placement_preview(
     window: Single<&Window, With<PrimaryWindow>>,
     camera_query: Single<(&Camera, &GlobalTransform), With<TowerCamera>>,
@@ -541,17 +621,11 @@ fn update_placement_preview(
         return;
     };
 
-    let properties = room_type.properties();
-    let room_width = properties.width as f32 * COLUMN_WIDTH;
-    let room_height = properties.height as f32 * FLOOR_HEIGHT;
+    let room_size = room_dimensions(room_type);
     for (mut sprite, mut transform, mut visibility) in &mut previews {
         sprite.color = room_preview_color(room_type);
-        sprite.custom_size = Some(Vec2::new(room_width - 4.0, room_height - 8.0));
-        transform.translation = Vec3::new(
-            column as f32 * COLUMN_WIDTH + room_width * 0.5,
-            floor as f32 * FLOOR_HEIGHT + room_height * 0.5,
-            3.0,
-        );
+        sprite.custom_size = Some(room_size);
+        transform.translation = room_position(floor, column, room_type).extend(3.0);
         *visibility = Visibility::Visible;
     }
 
@@ -572,6 +646,7 @@ fn update_placement_preview(
     }
 }
 
+/// Converts a world position to a valid floor and leftmost column.
 fn world_to_grid(position: Vec2) -> Option<(i32, u32)> {
     if !position.is_finite() {
         return None;
@@ -589,6 +664,25 @@ fn world_to_grid(position: Vec2) -> Option<(i32, u32)> {
     Some((floor as i32, column as u32))
 }
 
+/// Computes the rendered room size, leaving the floor thickness beneath it.
+fn room_dimensions(room_type: RoomType) -> Vec2 {
+    let properties = room_type.properties();
+    Vec2::new(
+        properties.width as f32 * COLUMN_WIDTH,
+        properties.height as f32 * FLOOR_HEIGHT - FLOOR_THICKNESS,
+    )
+}
+
+/// Returns the center of a room's world-space footprint.
+fn room_position(floor: i32, x: u32, room_type: RoomType) -> Vec2 {
+    let size = room_dimensions(room_type);
+    Vec2::new(
+        x as f32 * COLUMN_WIDTH + size.x * 0.5,
+        floor as f32 * FLOOR_HEIGHT + size.y * 0.5,
+    )
+}
+
+/// Reports whether a cursor position overlaps UI that should block building.
 fn pointer_over_ui(position: Vec2, window_size: Vec2, placement: &PlacementState) -> bool {
     let over_hud = position.y <= HUD_HEIGHT;
     let over_room_menu = position.x >= ROOM_MENU_LEFT
@@ -604,6 +698,7 @@ fn pointer_over_ui(position: Vec2, window_size: Vec2, placement: &PlacementState
     over_hud || over_room_menu || over_error_tooltip
 }
 
+/// Places the error tooltip near its click anchor while keeping it on screen.
 fn error_tooltip_position(anchor: Vec2, window_size: Vec2) -> Vec2 {
     let min_y = HUD_HEIGHT + 8.0;
     Vec2::new(
@@ -615,6 +710,7 @@ fn error_tooltip_position(anchor: Vec2, window_size: Vec2) -> Vec2 {
     )
 }
 
+/// Updates the error tooltip text, position, and visibility.
 fn update_error_tooltip(
     placement: Res<PlacementState>,
     window: Single<&Window, With<PrimaryWindow>>,
@@ -633,6 +729,7 @@ fn update_error_tooltip(
     }
 }
 
+/// Drains worker and simulation channels and applies their updates to the scene.
 fn receive_updates(
     mut commands: Commands,
     channels: Res<RendererChannels>,
@@ -741,22 +838,16 @@ fn receive_updates(
     }
 }
 
+/// Creates the room sprite corresponding to a successful build message.
 fn spawn_room(commands: &mut Commands, id: RoomId, floor: i32, x: u32, room_type: RoomType) {
-    let properties = room_type.properties();
-    let width = properties.width as f32 * COLUMN_WIDTH;
-    let height = properties.height as f32 * FLOOR_HEIGHT;
-    // Center the room sprite over its column/floor footprint; z=2 places it above floor segments.
     commands.spawn((
-        Sprite::from_color(room_color(room_type), Vec2::new(width - 4.0, height - 8.0)),
-        Transform::from_xyz(
-            x as f32 * COLUMN_WIDTH + width * 0.5,
-            floor as f32 * FLOOR_HEIGHT + height * 0.5,
-            2.0,
-        ),
+        Sprite::from_color(room_color(room_type), room_dimensions(room_type)),
+        Transform::from_translation(room_position(floor, x, room_type).extend(2.0)),
         RoomVisual(id),
     ));
 }
 
+/// Creates a single visible floor segment at its grid position.
 fn spawn_floor_segment(commands: &mut Commands, floor: i32, column: u32) {
     // A segment occupies one column and sits directly on its floor line.
     commands.spawn((
@@ -772,6 +863,7 @@ fn spawn_floor_segment(commands: &mut Commands, floor: i32, column: u32) {
     ));
 }
 
+/// Returns the opaque scene color associated with a room type.
 fn room_color(room_type: RoomType) -> Color {
     match room_type {
         RoomType::Condo => Color::srgb(0.28, 0.65, 0.84),
@@ -781,6 +873,7 @@ fn room_color(room_type: RoomType) -> Color {
     }
 }
 
+/// Returns a translucent placement-preview color for a room type.
 fn room_preview_color(room_type: RoomType) -> Color {
     let (red, green, blue) = match room_type {
         RoomType::Condo => (0.28, 0.65, 0.84),
@@ -791,6 +884,7 @@ fn room_preview_color(room_type: RoomType) -> Color {
     Color::srgba(red, green, blue, 0.36)
 }
 
+/// Reflects hover, press, and selection state in room-menu button colors.
 fn update_room_button_appearance(
     placement: Res<PlacementState>,
     mut buttons: Query<(
@@ -820,6 +914,7 @@ fn update_room_button_appearance(
     }
 }
 
+/// Refreshes the status text when simulation values change.
 fn update_hud(clock: Res<SimulationClock>, mut hud: Query<&mut Text, With<HudText>>) {
     if !clock.is_changed() {
         return;
@@ -829,6 +924,7 @@ fn update_hud(clock: Res<SimulationClock>, mut hud: Query<&mut Text, With<HudTex
     }
 }
 
+/// Formats the current simulation date, time, tick, and balance for display.
 fn format_clock(clock: &SimulationClock) -> String {
     let day_type = match clock.date.day_type {
         SimulationDayType::Weekday1 => "Weekday 1",
@@ -848,6 +944,7 @@ fn format_clock(clock: &SimulationClock) -> String {
     )
 }
 
+/// Formats a cash balance with a dollar sign and thousands separators.
 fn format_cash(cash: u64) -> String {
     let digits = cash.to_string();
     let first_group_len = match digits.len() % 3 {
@@ -864,6 +961,7 @@ fn format_cash(cash: u64) -> String {
     format!("${formatted}")
 }
 
+/// Reflects hover, press, and active state in simulation-speed buttons.
 fn update_button_appearance(
     active_speed: Res<ActiveSpeed>,
     mut buttons: Query<(
@@ -894,6 +992,7 @@ fn update_button_appearance(
     }
 }
 
+/// Focused tests for renderer state, camera geometry, and formatting helpers.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,6 +1030,70 @@ mod tests {
     }
 
     #[test]
+    fn zoom_keeps_the_world_point_under_the_cursor_stationary() {
+        let viewport = Vec2::new(1_280.0, 720.0);
+        let cursor = Vec2::new(960.0, 180.0);
+        let mut transform = Transform::from_xyz(400.0, 250.0, CAMERA_Z);
+        let mut projection = OrthographicProjection {
+            scale: 1.0,
+            ..OrthographicProjection::default_2d()
+        };
+        let cursor_offset = Vec2::new(cursor.x - viewport.x * 0.5, viewport.y * 0.5 - cursor.y);
+        let world_anchor_before =
+            transform.translation.truncate() + cursor_offset * projection.scale;
+
+        zoom_camera(&mut transform, &mut projection, 0.5, Some(cursor), viewport);
+
+        let world_anchor_after =
+            transform.translation.truncate() + cursor_offset * projection.scale;
+        assert!(world_anchor_after.abs_diff_eq(world_anchor_before, 0.001));
+        assert_eq!(projection.scale, 0.5);
+    }
+
+    #[test]
+    fn zoom_without_cursor_keeps_the_camera_center_fixed() {
+        let mut transform = Transform::from_xyz(400.0, 250.0, CAMERA_Z);
+        let mut projection = OrthographicProjection {
+            scale: 1.0,
+            ..OrthographicProjection::default_2d()
+        };
+        let center_before = transform.translation;
+
+        zoom_camera(
+            &mut transform,
+            &mut projection,
+            0.5,
+            None,
+            Vec2::new(1_280.0, 720.0),
+        );
+
+        assert_eq!(transform.translation, center_before);
+        assert_eq!(projection.scale, 0.5);
+    }
+
+    #[test]
+    fn pan_speed_decreases_slightly_when_zoomed_in() {
+        let zoomed_in = camera_pan_speed_factor(CAMERA_MIN_SCALE);
+        let halfway = camera_pan_speed_factor((CAMERA_MIN_SCALE + CAMERA_MAX_SCALE) * 0.5);
+        let zoomed_out = camera_pan_speed_factor(CAMERA_MAX_SCALE);
+
+        assert!(zoomed_in < halfway);
+        assert!(halfway < zoomed_out);
+        assert!(zoomed_in >= zoomed_out * 0.75);
+    }
+
+    #[test]
+    fn initial_camera_starts_just_above_the_first_two_underground_floors() {
+        let window_height = 720.0;
+        let center_y = initial_camera_y(window_height);
+        let visible_bottom = center_y - window_height * CAMERA_START_SCALE * 0.5;
+        let expected_bottom = -(INITIAL_UNDERGROUND_FLOORS as f32) * FLOOR_HEIGHT - FLOOR_THICKNESS;
+
+        assert!((visible_bottom - expected_bottom).abs() < f32::EPSILON);
+        assert!(CAMERA_MIN_SCALE < CAMERA_START_SCALE);
+    }
+
+    #[test]
     fn cash_is_formatted_with_thousands_separators() {
         assert_eq!(format_cash(2_000_000), "$2,000,000");
         assert_eq!(format_cash(45), "$45");
@@ -955,5 +1118,19 @@ mod tests {
             Some((2, 3))
         );
         assert_eq!(world_to_grid(Vec2::new(-1.0, 0.0)), None);
+    }
+
+    #[test]
+    fn rooms_fill_their_columns_and_rest_on_the_floor() {
+        let room_type = RoomType::Condo;
+        let size = room_dimensions(room_type);
+        let position = room_position(2, 0, room_type);
+
+        assert_eq!(size.x, room_type.properties().width as f32 * COLUMN_WIDTH);
+        assert_eq!(position.y - size.y * 0.5, 2.0 * FLOOR_HEIGHT);
+        assert_eq!(
+            room_position(2, room_type.properties().width, room_type).x - size.x * 0.5,
+            size.x
+        );
     }
 }
