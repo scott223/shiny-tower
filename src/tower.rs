@@ -2,7 +2,7 @@ use crate::elevator::{ElevatorId, ElevatorShaft};
 use crate::room::{Room, RoomId, RoomType};
 use slotmap::SlotMap;
 
-pub const FLOORS_ABOVE_GROUND: i32 = 100;
+pub const FLOORS_ABOVE_GROUND: i32 = 109;
 pub const FLOORS_BELOW_GROUND: i32 = 10;
 pub const MAX_FLOOR_WIDTH_COLUMNS: u32 = 400;
 pub const FLOOR_SEGMENT_COST: u64 = 500;
@@ -38,6 +38,7 @@ pub enum TowerError {
     FloorSegmentAlreadyExists { floor: i32, column: u32 },
     FloorSegmentUnsupported { floor: i32, column: u32 },
     FloorSegmentOverlapsElevator { floor: i32, column: u32 },
+    GroundFloorLobbyOnly,
     LobbyOnlyAllowedOnEveryFifteenthFloor { floor: i32 },
     RoomOverlap(RoomId),
     ElevatorOverlap { column: u32 },
@@ -121,6 +122,10 @@ impl Tower {
             });
         }
 
+        if floor_number == 0 {
+            return Err(TowerError::GroundFloorLobbyOnly);
+        }
+
         // Do not create duplicate structure at the same floor and column.
         if self.floors[floor_index].floor_segments.contains(&column) {
             return Err(TowerError::FloorSegmentAlreadyExists {
@@ -178,6 +183,9 @@ impl Tower {
             return Err(TowerError::LobbyOnlyAllowedOnEveryFifteenthFloor {
                 floor: floor_number,
             });
+        }
+        if floor_number == 0 && room_type != RoomType::Lobby {
+            return Err(TowerError::GroundFloorLobbyOnly);
         }
 
         let width = room_type.properties().width;
@@ -385,7 +393,10 @@ mod tests {
         columns: std::ops::Range<u32>,
     ) {
         for column in columns {
-            for floor in 0..=floor_number {
+            tower
+                .build_room(0, column, RoomType::Lobby)
+                .expect("lobby should provide ground-floor support");
+            for floor in 1..=floor_number {
                 tower
                     .build_floor_segment(floor, column)
                     .expect("floor segment should have support");
@@ -424,12 +435,16 @@ mod tests {
                 column: 5
             })
         ));
+        assert_eq!(
+            tower.build_floor_segment(0, 5),
+            Err(TowerError::GroundFloorLobbyOnly)
+        );
         tower
-            .build_floor_segment(0, 5)
-            .expect("ground floor is the foundation");
+            .build_room(0, 5, RoomType::Lobby)
+            .expect("lobby should build on the ground floor");
         tower
             .build_floor_segment(1, 5)
-            .expect("ground segment should support the next floor");
+            .expect("ground-floor lobby should support the next floor");
         tower
             .build_floor_segment(2, 5)
             .expect("floor segment should support the floor above it");
@@ -447,11 +462,8 @@ mod tests {
     fn floor_segment_can_be_supported_by_a_room_below() {
         let mut tower = Tower::default();
         tower
-            .build_floor_segment(0, 8)
-            .expect("ground floor is the foundation");
-        tower
             .build_room(0, 8, RoomType::Lobby)
-            .expect("room should build on its floor segment");
+            .expect("lobby should build on the ground floor");
         let ground_floor = tower
             .floors
             .iter_mut()
@@ -468,14 +480,33 @@ mod tests {
     #[test]
     fn room_build_automatically_adds_ground_and_supported_floor_segments() {
         let mut tower = Tower::default();
-        assert!(tower.build_room(0, 0, RoomType::Condo).is_ok());
+        for room_type in [RoomType::Condo, RoomType::PartyHall, RoomType::Office] {
+            assert_eq!(
+                tower.build_room(0, 0, room_type),
+                Err(TowerError::GroundFloorLobbyOnly)
+            );
+        }
+        let ground_floor = tower
+            .floors
+            .iter()
+            .find(|floor| floor.number == 0)
+            .expect("ground floor should exist");
+        assert!(ground_floor.floor_segments.is_empty());
+        assert!(ground_floor.rooms.is_empty());
+
+        tower
+            .build_room(0, 0, RoomType::Lobby)
+            .expect("lobby should build on the ground floor");
+        build_supported_segments(&mut tower, 1, 1..16);
 
         let ground_floor = tower
             .floors
             .iter()
             .find(|floor| floor.number == 0)
             .expect("ground floor should exist");
-        assert_eq!(ground_floor.floor_segments, (0..16).collect::<Vec<_>>());
+        let mut ground_segments = ground_floor.floor_segments.clone();
+        ground_segments.sort_unstable();
+        assert_eq!(ground_segments, (0..16).collect::<Vec<_>>());
 
         assert!(tower.build_room(1, 0, RoomType::Condo).is_ok());
         let first_floor = tower
@@ -483,7 +514,9 @@ mod tests {
             .iter()
             .find(|floor| floor.number == 1)
             .expect("first floor should exist");
-        assert_eq!(first_floor.floor_segments, (0..16).collect::<Vec<_>>());
+        let mut first_floor_segments = first_floor.floor_segments.clone();
+        first_floor_segments.sort_unstable();
+        assert_eq!(first_floor_segments, (0..16).collect::<Vec<_>>());
     }
 
     #[test]
@@ -509,27 +542,27 @@ mod tests {
     #[test]
     fn room_can_auto_build_floor_segments_supported_by_a_room_below() {
         let mut tower = Tower::default();
-        build_supported_segments(&mut tower, 0, 8..32);
+        build_supported_segments(&mut tower, 1, 8..32);
         tower
-            .build_room(0, 8, RoomType::PartyHall)
-            .expect("room should build on its floor segment");
-        let ground_floor = tower
+            .build_room(1, 8, RoomType::PartyHall)
+            .expect("room should build on its floor segments");
+        let first_floor = tower
             .floors
             .iter_mut()
-            .find(|floor| floor.number == 0)
-            .expect("ground floor should exist");
+            .find(|floor| floor.number == 1)
+            .expect("first floor should exist");
         // Remove the segment to isolate the room as the support source.
-        ground_floor.floor_segments.clear();
+        first_floor.floor_segments.clear();
 
         tower
-            .build_room(1, 8, RoomType::Office)
+            .build_room(2, 8, RoomType::Office)
             .expect("room below should support the automatically added segment");
         assert!(
             tower
                 .floors
                 .iter()
-                .find(|floor| floor.number == 1)
-                .expect("first floor should exist")
+                .find(|floor| floor.number == 2)
+                .expect("second floor should exist")
                 .floor_segments
                 .contains(&8)
         );
@@ -538,12 +571,12 @@ mod tests {
     #[test]
     fn unsupported_room_build_does_not_add_partial_floor_segments() {
         let mut tower = Tower::default();
-        build_supported_segments(&mut tower, 0, 0..15);
+        build_supported_segments(&mut tower, 1, 0..15);
 
         assert!(matches!(
-            tower.build_room(1, 0, RoomType::Condo),
+            tower.build_room(2, 0, RoomType::Condo),
             Err(TowerError::FloorSegmentUnsupported {
-                floor: 1,
+                floor: 2,
                 column: 15
             })
         ));
@@ -551,8 +584,8 @@ mod tests {
             tower
                 .floors
                 .iter()
-                .find(|floor| floor.number == 1)
-                .expect("first floor should exist")
+                .find(|floor| floor.number == 2)
+                .expect("second floor should exist")
                 .floor_segments
                 .is_empty()
         );
@@ -564,18 +597,18 @@ mod tests {
         let condo_width = RoomType::Condo.properties().width;
         build_supported_segments(
             &mut tower,
-            0,
+            1,
             MAX_FLOOR_WIDTH_COLUMNS - condo_width..MAX_FLOOR_WIDTH_COLUMNS,
         );
 
         assert!(
             tower
-                .build_room(0, MAX_FLOOR_WIDTH_COLUMNS - condo_width, RoomType::Condo,)
+                .build_room(1, MAX_FLOOR_WIDTH_COLUMNS - condo_width, RoomType::Condo,)
                 .is_ok()
         );
         assert!(matches!(
             tower.build_room(
-                0,
+                1,
                 MAX_FLOOR_WIDTH_COLUMNS - condo_width + 1,
                 RoomType::Condo,
             ),
@@ -586,17 +619,17 @@ mod tests {
     #[test]
     fn room_build_is_rejected_if_its_columns_overlap_an_existing_room() {
         let mut tower = Tower::default();
-        build_supported_segments(&mut tower, 0, 9..35);
+        build_supported_segments(&mut tower, 1, 9..35);
         let existing_room_id = tower
-            .build_room(0, 10, RoomType::Condo)
+            .build_room(1, 10, RoomType::Condo)
             .expect("first room should build");
 
         assert!(matches!(
-            tower.build_room(0, 9, RoomType::Office),
+            tower.build_room(1, 9, RoomType::Office),
             Err(TowerError::RoomOverlap(room_id)) if room_id == existing_room_id
         ));
         assert!(
-            tower.build_room(0, 26, RoomType::Office).is_ok(),
+            tower.build_room(1, 26, RoomType::Office).is_ok(),
             "rooms whose edges touch should not overlap"
         );
     }
@@ -609,9 +642,9 @@ mod tests {
             .expect("elevator shaft should build across empty floors");
 
         assert!(matches!(
-            tower.build_floor_segment(0, 12),
+            tower.build_floor_segment(1, 12),
             Err(TowerError::FloorSegmentOverlapsElevator {
-                floor: 0,
+                floor: 1,
                 column: 12
             })
         ));
@@ -634,9 +667,6 @@ mod tests {
         tower
             .remove_elevator_shaft(elevator_id)
             .expect("elevator shaft should be removable by its ID");
-        tower
-            .build_floor_segment(0, 12)
-            .expect("ground floor segment should build after elevator removal");
         assert!(tower.build_room(0, 12, RoomType::Lobby).is_ok());
         assert!(matches!(
             tower.remove_elevator_shaft(elevator_id),
@@ -647,16 +677,16 @@ mod tests {
     #[test]
     fn elevator_build_is_rejected_if_a_room_occupies_its_column() {
         let mut tower = Tower::default();
-        build_supported_segments(&mut tower, 0, 10..26);
+        build_supported_segments(&mut tower, 1, 10..26);
         let room_id = tower
-            .build_room(0, 10, RoomType::Condo)
+            .build_room(1, 10, RoomType::Condo)
             .expect("room should build");
 
         assert!(matches!(
-            tower.build_elevator_shaft(12, -1, 1),
+            tower            .build_elevator_shaft(12, 1, 1),
             Err(TowerError::ElevatorOverlapsRoom {
                 room_id: overlapping_id,
-                floor: 0
+                floor: 1
             }) if overlapping_id == room_id
         ));
     }
@@ -682,7 +712,7 @@ mod tests {
             .expect("built room should be found by ID");
         assert_eq!(removed_room.x, 0);
         assert!(tower.floors[floor_index].rooms.is_empty());
-        assert!(tower.rooms.is_empty());
+        assert_eq!(tower.rooms.len(), 16);
 
         let replacement = tower
             .build_room(1, 0, RoomType::Condo)
@@ -695,9 +725,9 @@ mod tests {
     #[test]
     fn removing_unknown_room_returns_an_error() {
         let mut tower = Tower::default();
-        build_supported_segments(&mut tower, 0, 0..16);
+        build_supported_segments(&mut tower, 1, 0..16);
         let room_id = tower
-            .build_room(0, 0, RoomType::Condo)
+            .build_room(1, 0, RoomType::Condo)
             .expect("room should build");
         tower
             .remove_room(room_id)

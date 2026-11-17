@@ -36,9 +36,14 @@ pub fn run(
 
         loop {
             match from_simulation.try_recv() {
-                Ok(SimulationRendererMessage::Tick { tick, date, time }) => {
+                Ok(SimulationRendererMessage::Tick {
+                    tick,
+                    date,
+                    time,
+                    cash,
+                }) => {
                     eprintln!(
-                        "simulation tick {tick}: time {:02}:{:02} ({:?}), day of week {:?}, quarter Q{} (year {})",
+                        "simulation tick {tick}: time {:02}:{:02} ({:?}), day of week {:?}, quarter Q{} (year {}), cash {cash}",
                         time.hour, time.minute, time.period, date.day_type, date.quarter, date.year
                     );
                 }

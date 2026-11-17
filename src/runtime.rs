@@ -10,20 +10,28 @@ pub fn run() {
     let (renderer_to_worker_sender, renderer_to_worker_receiver) = mpsc::channel();
     let (worker_to_renderer_sender, worker_to_renderer_receiver) = mpsc::channel();
     let (simulation_to_renderer_sender, simulation_to_renderer_receiver) = mpsc::channel();
+    let (speed_request_sender, speed_request_receiver) = mpsc::channel();
 
     // The simulation advances ticks independently and publishes them to the renderer.
     let simulation_state = Arc::clone(&game_state);
-    let simulation_thread =
-        thread::spawn(move || simulation::run(simulation_state, simulation_to_renderer_sender));
+    let simulation_thread = thread::spawn(move || {
+        simulation::run(
+            simulation_state,
+            speed_request_receiver,
+            simulation_to_renderer_sender,
+        )
+    });
 
     // The worker applies UI requests and publishes resulting state changes.
     let worker_state = Arc::clone(&game_state);
     let worker_to_renderer = worker_to_renderer_sender.clone();
+    let worker_to_simulation = speed_request_sender;
     let _worker_thread = thread::spawn(move || {
         worker::run(
             renderer_to_worker_receiver,
             worker_state,
             worker_to_renderer,
+            worker_to_simulation,
         )
     });
 

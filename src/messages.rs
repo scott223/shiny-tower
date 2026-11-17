@@ -24,6 +24,8 @@ pub enum RendererWorkerMessage {
 /// UI requests handled by the worker.
 #[derive(Debug)]
 pub enum UiInput {
+    /// Set how quickly simulation ticks advance.
+    SetSimulationSpeed(SimulationSpeed),
     /// Request a room be built on a floor.
     BuildRoom {
         floor: i32,
@@ -37,6 +39,15 @@ pub enum UiInput {
     RemoveRoom(RoomId),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Simulation tick rate requested by the renderer.
+pub enum SimulationSpeed {
+    Paused,
+    OneX,
+    ThreeX,
+    FiveX,
+}
+
 /// Simulation updates sent directly from the simulation thread to the renderer.
 #[derive(Debug)]
 pub enum SimulationRendererMessage {
@@ -45,6 +56,7 @@ pub enum SimulationRendererMessage {
         tick: u64,
         date: SimulationDate,
         time: SimulationTime,
+        cash: u64,
     },
     /// Stops the renderer's simulation-update receiver.
     Shutdown,

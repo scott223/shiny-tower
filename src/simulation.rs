@@ -1,10 +1,12 @@
 use crate::GameState;
 use crate::messages::{
-    SimulationDate, SimulationDayType, SimulationRendererMessage, SimulationTime, TimeOfDayPeriod,
-    send_message,
+    SimulationDate, SimulationDayType, SimulationRendererMessage, SimulationSpeed, SimulationTime,
+    TimeOfDayPeriod, send_message,
 };
-use std::sync::{Arc, Mutex, mpsc::Sender};
-use std::thread;
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{Receiver, RecvTimeoutError, Sender},
+};
 use std::time::Duration;
 
 /// Simulation tick cadence, independent of how quickly the renderer draws frames.
@@ -72,6 +74,15 @@ fn date_at_tick(tick: u64) -> SimulationDate {
     }
 }
 
+fn tick_interval(speed: SimulationSpeed) -> Option<Duration> {
+    match speed {
+        SimulationSpeed::Paused => None,
+        SimulationSpeed::OneX => Some(TICK_INTERVAL),
+        SimulationSpeed::ThreeX => Some(TICK_INTERVAL / 3),
+        SimulationSpeed::FiveX => Some(TICK_INTERVAL / 5),
+    }
+}
+
 fn apply_quarterly_room_profit(
     state: &mut GameState,
     tick: u64,
@@ -100,19 +111,41 @@ fn apply_quarterly_room_profit(
 
 /// Advances the shared simulation tick and publishes each tick to the renderer.
 ///
-/// The lock is held only while changing and reading the tick counter.
-pub fn run(game_state: Arc<Mutex<GameState>>, to_renderer: Sender<SimulationRendererMessage>) {
+/// The lock is held only while changing and reading the tick counter and cash balance.
+pub fn run(
+    game_state: Arc<Mutex<GameState>>,
+    from_renderer: Receiver<SimulationSpeed>,
+    to_renderer: Sender<SimulationRendererMessage>,
+) {
+    let mut speed = SimulationSpeed::OneX;
     loop {
-        // Pace updates independently of renderer frame timing.
-        thread::sleep(TICK_INTERVAL);
+        // A paused simulation waits for a new speed request instead of polling or advancing.
+        match tick_interval(speed) {
+            None => match from_renderer.recv() {
+                Ok(new_speed) => {
+                    speed = new_speed;
+                    continue;
+                }
+                Err(_) => break,
+            },
+            Some(interval) => match from_renderer.recv_timeout(interval) {
+                Ok(new_speed) => {
+                    speed = new_speed;
+                    continue;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+        }
+
         // Saturation keeps the counter from wrapping back to zero after u64::MAX ticks.
         // Release the state lock before publishing so a slow renderer cannot block state access.
-        let (tick, profit_result) = match game_state.lock() {
+        let (tick, cash, profit_result) = match game_state.lock() {
             Ok(mut state) => {
                 state.simulation_tick = state.simulation_tick.saturating_add(1);
                 let tick = state.simulation_tick;
                 let profit_result = apply_quarterly_room_profit(&mut state, tick);
-                (tick, profit_result)
+                (tick, state.economy.cash, profit_result)
             }
             Err(error) => {
                 eprintln!("game state lock poisoned: {error}");
@@ -128,14 +161,19 @@ pub fn run(game_state: Arc<Mutex<GameState>>, to_renderer: Sender<SimulationRend
                 tick,
                 date: date_at_tick(tick),
                 time: time_of_day(tick),
+                cash,
             },
         );
     }
+
+    send_message(&to_renderer, SimulationRendererMessage::Shutdown);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
 
     #[test]
     fn tick_schedule_maps_day_boundaries_and_wraps() {
@@ -154,6 +192,53 @@ mod tests {
             let time = time_of_day(tick);
             assert_eq!((time.hour, time.minute), (hour, minute));
         }
+    }
+
+    #[test]
+    fn simulation_speeds_have_expected_tick_intervals() {
+        assert_eq!(tick_interval(SimulationSpeed::Paused), None);
+        assert_eq!(tick_interval(SimulationSpeed::OneX), Some(TICK_INTERVAL));
+        assert_eq!(
+            tick_interval(SimulationSpeed::ThreeX),
+            Some(TICK_INTERVAL / 3)
+        );
+        assert_eq!(
+            tick_interval(SimulationSpeed::FiveX),
+            Some(TICK_INTERVAL / 5)
+        );
+    }
+
+    #[test]
+    fn paused_simulation_waits_for_speed_request_before_advancing() {
+        let game_state = Arc::new(Mutex::new(GameState::default()));
+        let (speed_sender, speed_receiver) = mpsc::channel();
+        let (renderer_sender, renderer_receiver) = mpsc::channel();
+        let simulation = thread::spawn(move || {
+            run(game_state, speed_receiver, renderer_sender);
+        });
+
+        speed_sender.send(SimulationSpeed::Paused).unwrap();
+        thread::sleep(Duration::from_millis(60));
+        assert!(matches!(
+            renderer_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        speed_sender.send(SimulationSpeed::FiveX).unwrap();
+        assert!(matches!(
+            renderer_receiver.recv_timeout(Duration::from_millis(100)),
+            Ok(SimulationRendererMessage::Tick {
+                tick: 1,
+                cash: 2_000_000,
+                ..
+            })
+        ));
+        drop(speed_sender);
+        simulation.join().unwrap();
+        assert!(matches!(
+            renderer_receiver.recv().unwrap(),
+            SimulationRendererMessage::Shutdown
+        ));
     }
 
     #[test]

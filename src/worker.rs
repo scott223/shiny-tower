@@ -1,5 +1,5 @@
 use crate::GameState;
-use crate::messages::{RendererWorkerMessage, UiInput, send_message};
+use crate::messages::{RendererWorkerMessage, SimulationSpeed, UiInput, send_message};
 use crate::tower::FLOOR_SEGMENT_COST;
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -8,10 +8,14 @@ pub fn run(
     receiver: mpsc::Receiver<RendererWorkerMessage>,
     game_state: Arc<Mutex<GameState>>,
     to_renderer: mpsc::Sender<RendererWorkerMessage>,
+    to_simulation: mpsc::Sender<SimulationSpeed>,
 ) {
     // Process UI messages in order so worker-owned state changes stay ordered.
     while let Ok(message) = receiver.recv() {
         match message {
+            RendererWorkerMessage::UiInput(UiInput::SetSimulationSpeed(speed)) => {
+                send_message(&to_simulation, speed);
+            }
             RendererWorkerMessage::UiInput(UiInput::BuildRoom {
                 floor,
                 x,
@@ -151,7 +155,8 @@ mod tests {
     ) -> mpsc::Receiver<RendererWorkerMessage> {
         let (input_sender, input_receiver) = mpsc::channel();
         let (output_sender, output_receiver) = mpsc::channel();
-        let worker = thread::spawn(move || run(input_receiver, state, output_sender));
+        let (speed_sender, _speed_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || run(input_receiver, state, output_sender, speed_sender));
         // Shut down after one request so each test can inspect the resulting state and messages.
         input_sender
             .send(RendererWorkerMessage::UiInput(input))
@@ -164,16 +169,47 @@ mod tests {
     }
 
     #[test]
+    fn simulation_speed_request_is_forwarded_to_simulation() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let (output_sender, output_receiver) = mpsc::channel();
+        let (speed_sender, speed_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            run(
+                input_receiver,
+                Arc::new(Mutex::new(GameState::default())),
+                output_sender,
+                speed_sender,
+            )
+        });
+
+        input_sender
+            .send(RendererWorkerMessage::UiInput(UiInput::SetSimulationSpeed(
+                SimulationSpeed::ThreeX,
+            )))
+            .expect("worker should receive the speed request");
+        input_sender
+            .send(RendererWorkerMessage::Shutdown)
+            .expect("worker should receive shutdown");
+        worker.join().expect("worker should exit");
+
+        assert_eq!(speed_receiver.recv().unwrap(), SimulationSpeed::ThreeX);
+        assert!(matches!(
+            output_receiver.recv().unwrap(),
+            RendererWorkerMessage::Shutdown
+        ));
+    }
+
+    #[test]
     fn building_room_deducts_its_cost_from_cash() {
         let mut building = Tower::default();
-        // Prebuild the room's full support footprint so only the room cost is charged.
+        // Ground-floor lobbies support the upper-floor segments under the room.
         for column in 0..16 {
             building
-                .build_floor_segment(0, column)
-                .expect("ground floor segment should build");
+                .build_room(0, column, crate::room::RoomType::Lobby)
+                .expect("ground-floor lobby should build");
             building
                 .build_floor_segment(1, column)
-                .expect("ground segment should support the upper floor");
+                .expect("lobby should support the upper-floor segment");
         }
         let state = Arc::new(Mutex::new(GameState {
             building,
@@ -185,8 +221,10 @@ mod tests {
         }));
         let (input_sender, input_receiver) = mpsc::channel();
         let (output_sender, output_receiver) = mpsc::channel();
+        let (speed_sender, _speed_receiver) = mpsc::channel();
         let worker_state = Arc::clone(&state);
-        let worker = thread::spawn(move || run(input_receiver, worker_state, output_sender));
+        let worker =
+            thread::spawn(move || run(input_receiver, worker_state, output_sender, speed_sender));
 
         input_sender
             .send(RendererWorkerMessage::UiInput(UiInput::BuildRoom {
@@ -222,8 +260,10 @@ mod tests {
         }));
         let (input_sender, input_receiver) = mpsc::channel();
         let (output_sender, output_receiver) = mpsc::channel();
+        let (speed_sender, _speed_receiver) = mpsc::channel();
         let worker_state = Arc::clone(&state);
-        let worker = thread::spawn(move || run(input_receiver, worker_state, output_sender));
+        let worker =
+            thread::spawn(move || run(input_receiver, worker_state, output_sender, speed_sender));
 
         input_sender
             .send(RendererWorkerMessage::UiInput(UiInput::BuildRoom {
@@ -246,7 +286,17 @@ mod tests {
 
     #[test]
     fn building_room_is_rejected_when_cash_is_insufficient() {
+        let mut building = Tower::default();
+        for column in 0..16 {
+            building
+                .build_room(0, column, crate::room::RoomType::Lobby)
+                .expect("ground-floor lobby should build");
+            building
+                .build_floor_segment(1, column)
+                .expect("lobby should support the upper-floor segment");
+        }
         let state = Arc::new(Mutex::new(GameState {
+            building,
             economy: crate::economy::Economy {
                 cash: 99,
                 ..Default::default()
@@ -255,8 +305,10 @@ mod tests {
         }));
         let (input_sender, input_receiver) = mpsc::channel();
         let (output_sender, output_receiver) = mpsc::channel();
+        let (speed_sender, _speed_receiver) = mpsc::channel();
         let worker_state = Arc::clone(&state);
-        let worker = thread::spawn(move || run(input_receiver, worker_state, output_sender));
+        let worker =
+            thread::spawn(move || run(input_receiver, worker_state, output_sender, speed_sender));
 
         input_sender
             .send(RendererWorkerMessage::UiInput(UiInput::BuildRoom {
@@ -272,7 +324,7 @@ mod tests {
 
         let state = state.lock().unwrap();
         assert_eq!(state.economy.cash, 99);
-        assert!(state.building.rooms.is_empty());
+        assert!(state.building.floors[11].rooms.is_empty());
         drop(state);
         assert!(matches!(
             output_receiver.recv().unwrap(),
@@ -282,7 +334,12 @@ mod tests {
 
     #[test]
     fn building_floor_segment_deducts_its_cost_and_checks_cash() {
+        let mut building = Tower::default();
+        building
+            .build_room(0, 7, crate::room::RoomType::Lobby)
+            .expect("ground-floor lobby should build");
         let state = Arc::new(Mutex::new(GameState {
+            building,
             economy: crate::economy::Economy {
                 cash: FLOOR_SEGMENT_COST,
                 ..Default::default()
@@ -292,21 +349,21 @@ mod tests {
         let output = run_worker_request(
             Arc::clone(&state),
             UiInput::BuildFloorSegment {
-                floor: 0,
+                floor: 1,
                 column: 7,
             },
         );
 
         assert_eq!(state.lock().unwrap().economy.cash, 0);
         assert!(
-            state.lock().unwrap().building.floors[10]
+            state.lock().unwrap().building.floors[11]
                 .floor_segments
                 .contains(&7)
         );
         assert!(matches!(
             output.recv().unwrap(),
             RendererWorkerMessage::FloorSegmentBuilt {
-                floor: 0,
+                floor: 1,
                 column: 7
             }
         ));
@@ -315,7 +372,12 @@ mod tests {
             RendererWorkerMessage::Shutdown
         ));
 
+        let mut building = Tower::default();
+        building
+            .build_room(0, 7, crate::room::RoomType::Lobby)
+            .expect("ground-floor lobby should build");
         let state = Arc::new(Mutex::new(GameState {
+            building,
             economy: crate::economy::Economy {
                 cash: FLOOR_SEGMENT_COST - 1,
                 ..Default::default()
@@ -325,14 +387,14 @@ mod tests {
         let output = run_worker_request(
             Arc::clone(&state),
             UiInput::BuildFloorSegment {
-                floor: 0,
+                floor: 1,
                 column: 7,
             },
         );
 
         let state = state.lock().unwrap();
         assert_eq!(state.economy.cash, FLOOR_SEGMENT_COST - 1);
-        assert!(state.building.floors[10].floor_segments.is_empty());
+        assert!(state.building.floors[11].floor_segments.is_empty());
         drop(state);
         assert!(matches!(
             output.recv().unwrap(),
@@ -343,10 +405,15 @@ mod tests {
     #[test]
     fn building_room_charges_only_for_missing_floor_segments() {
         let mut building = Tower::default();
+        for column in 0..16 {
+            building
+                .build_room(0, column, crate::room::RoomType::Lobby)
+                .expect("ground-floor lobby should build");
+        }
         for column in 0..15 {
             building
-                .build_floor_segment(0, column)
-                .expect("ground floor segment should build");
+                .build_floor_segment(1, column)
+                .expect("lobby should support the upper-floor segment");
         }
         let state = Arc::new(Mutex::new(GameState {
             building,
@@ -359,7 +426,7 @@ mod tests {
         let output = run_worker_request(
             Arc::clone(&state),
             UiInput::BuildRoom {
-                floor: 0,
+                floor: 1,
                 x: 0,
                 room_type: crate::room::RoomType::Condo,
             },
@@ -367,8 +434,8 @@ mod tests {
 
         let state = state.lock().unwrap();
         assert_eq!(state.economy.cash, 0);
-        assert_eq!(state.building.floors[10].floor_segments.len(), 16);
-        assert_eq!(state.building.floors[10].rooms.len(), 1);
+        assert_eq!(state.building.floors[11].floor_segments.len(), 16);
+        assert_eq!(state.building.floors[11].rooms.len(), 1);
         drop(state);
         assert!(matches!(
             output.recv().unwrap(),
@@ -382,9 +449,21 @@ mod tests {
 
     #[test]
     fn room_build_with_insufficient_segment_funds_changes_nothing() {
+        let mut building = Tower::default();
+        for column in 0..16 {
+            building
+                .build_room(0, column, crate::room::RoomType::Lobby)
+                .expect("ground-floor lobby should build");
+        }
+        for column in 0..15 {
+            building
+                .build_floor_segment(1, column)
+                .expect("lobby should support the upper-floor segment");
+        }
         let state = Arc::new(Mutex::new(GameState {
+            building,
             economy: crate::economy::Economy {
-                cash: 8_099,
+                cash: 599,
                 ..Default::default()
             },
             ..Default::default()
@@ -392,16 +471,16 @@ mod tests {
         let output = run_worker_request(
             Arc::clone(&state),
             UiInput::BuildRoom {
-                floor: 0,
+                floor: 1,
                 x: 0,
                 room_type: crate::room::RoomType::Condo,
             },
         );
 
         let state = state.lock().unwrap();
-        assert_eq!(state.economy.cash, 8_099);
-        assert!(state.building.floors[10].floor_segments.is_empty());
-        assert!(state.building.rooms.is_empty());
+        assert_eq!(state.economy.cash, 599);
+        assert_eq!(state.building.floors[11].floor_segments.len(), 15);
+        assert!(state.building.floors[11].rooms.is_empty());
         drop(state);
         assert!(matches!(
             output.recv().unwrap(),
