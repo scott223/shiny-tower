@@ -10,12 +10,11 @@ use std::sync::{
 use std::time::Duration;
 
 /// Simulation tick cadence, independent of how quickly the renderer draws frames.
-const TICK_INTERVAL: Duration = Duration::from_millis(20);
+const TICK_INTERVAL: Duration = Duration::from_millis(60);
 const TICKS_PER_DAY: u64 = 2_600;
 const DAYS_PER_QUARTER: u64 = 3;
 const DAYS_PER_YEAR: u64 = 12;
 const TICKS_PER_QUARTER: u64 = TICKS_PER_DAY * DAYS_PER_QUARTER;
-const TICKS_PER_YEAR: u64 = TICKS_PER_DAY * DAYS_PER_YEAR;
 
 // Entries are (start tick, end tick, start minute, end minute, period); tick ranges are
 // start-inclusive and end-exclusive. The seven intervals map to 07:00–12:00 Day,

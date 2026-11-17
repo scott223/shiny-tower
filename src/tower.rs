@@ -2,49 +2,78 @@ use crate::elevator::{ElevatorId, ElevatorShaft};
 use crate::room::{Room, RoomId, RoomType};
 use slotmap::SlotMap;
 
+/// Number of floors from ground level upward, including ground.
 pub const FLOORS_ABOVE_GROUND: i32 = 109;
+/// Number of floors below ground level.
 pub const FLOORS_BELOW_GROUND: i32 = 10;
+/// Number of columns available on each floor.
 pub const MAX_FLOOR_WIDTH_COLUMNS: u32 = 400;
+/// Cost of building one floor segment.
 pub const FLOOR_SEGMENT_COST: u64 = 500;
 
 #[derive(Debug)]
-/// Building layout, including floors and elevator shafts.
+/// Building layout with floors numbered from `-FLOORS_BELOW_GROUND` through
+/// `FLOORS_ABOVE_GROUND - 1`, including rooms and elevator shafts.
 pub struct Tower {
+    /// Floors in ascending numeric order.
     pub floors: Vec<Floor>,
+    /// Rooms indexed by their stable IDs.
     pub rooms: SlotMap<RoomId, Room>,
+    /// Elevator shafts indexed by their stable IDs.
     pub elevator_shafts: SlotMap<ElevatorId, ElevatorShaft>,
 }
 
+/// Validated placement data used to price or commit a room build.
 struct RoomBuildPlan {
+    /// Index of the floor where the room will be placed.
     floor_index: usize,
+    /// Floor columns that construction must add to support the room.
     missing_segments: Vec<u32>,
 }
 
 #[derive(Debug, Default)]
 /// A single floor and the rooms placed on it.
 pub struct Floor {
+    /// Numeric floor level; zero is ground level.
     pub number: i32,
+    /// Columns occupied by floor segments, including segments added for rooms.
     pub floor_segments: Vec<u32>,
+    /// IDs of rooms placed on this floor.
     pub rooms: Vec<RoomId>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 /// Errors returned by tower operations.
 pub enum TowerError {
+    /// The requested floor does not exist.
     FloorNotFound(i32),
+    /// A column is outside the tower's horizontal bounds.
     ColumnOutOfRange(u32),
+    /// A room footprint extends past the last column on its floor.
     RoomExceedsFloorWidth { x: u32, width: u32 },
+    /// A required floor segment cannot be built below ground level.
     FloorSegmentBelowGround { floor: i32, column: u32 },
+    /// A segment already occupies this floor and column.
     FloorSegmentAlreadyExists { floor: i32, column: u32 },
+    /// No room or segment directly below supports this segment.
     FloorSegmentUnsupported { floor: i32, column: u32 },
+    /// An elevator shaft already occupies this floor and column.
     FloorSegmentOverlapsElevator { floor: i32, column: u32 },
+    /// Only a lobby may be placed on ground level; standalone segments are not allowed there.
     GroundFloorLobbyOnly,
+    /// A lobby may be placed only on ground level or a positive multiple of 15.
     LobbyOnlyAllowedOnEveryFifteenthFloor { floor: i32 },
+    /// The proposed room footprint intersects an existing room.
     RoomOverlap(RoomId),
+    /// An elevator shaft already occupies the requested column on this floor.
     ElevatorOverlap { column: u32 },
+    /// The elevator's start floor is above its end floor.
     InvalidElevatorFloorRange { start_floor: i32, end_floor: i32 },
+    /// The elevator shaft would intersect an existing room.
     ElevatorOverlapsRoom { room_id: RoomId, floor: i32 },
+    /// The requested elevator shaft does not exist.
     ElevatorNotFound(ElevatorId),
+    /// The requested room does not exist.
     RoomNotFound(RoomId),
 }
 
@@ -96,7 +125,8 @@ impl Tower {
 
     /// Builds one floor segment at the given column.
     ///
-    /// Floor 0 is the foundation. Higher segments require a segment or room directly below.
+    /// Segments cannot be placed below ground or independently at ground level; a ground-floor
+    /// lobby may add its occupied support segment. Higher floors require support directly below.
     pub fn build_floor_segment(
         &mut self,
         floor_number: i32,
@@ -122,6 +152,7 @@ impl Tower {
             });
         }
 
+        // Ground level is reserved for lobbies; floor segments are not built there independently.
         if floor_number == 0 {
             return Err(TowerError::GroundFloorLobbyOnly);
         }
@@ -146,7 +177,7 @@ impl Tower {
             });
         }
 
-        // Ground segments sit directly on the foundation; upper segments need support below.
+        // All permitted standalone segments are above ground and require direct support.
         if floor_number > 0 {
             if !self.column_has_support_below(floor_number, column)? {
                 return Err(TowerError::FloorSegmentUnsupported {
@@ -207,8 +238,8 @@ impl Tower {
             });
         }
 
-        // Plan segments for the whole room footprint. Ground is supported by the foundation;
-        // higher floors need existing room or segment support directly underneath each column.
+        // Plan segments for the whole room footprint. Ground-floor lobby segments need no support
+        // below; segments on higher floors require a room or segment directly underneath.
         let mut missing_segments = Vec::new();
         for column in x..x + width {
             if !self.floors[floor_index].floor_segments.contains(&column) {
@@ -272,9 +303,10 @@ impl Tower {
 
     /// Creates a room at the given floor and column.
     ///
-    /// Missing floor segments are added if they have support below. The build fails if any
-    /// required segment is unsupported, the room exceeds the floor width, overlaps another room,
-    /// or overlaps an elevator shaft.
+    /// Only lobbies may be placed on ground level, and lobbies are restricted to ground level and
+    /// positive multiples of 15. Missing floor segments are added automatically; segments above
+    /// ground must have support below. The build fails if the room exceeds the floor width,
+    /// overlaps another room, or overlaps an elevator shaft.
     pub fn build_room(
         &mut self,
         floor_number: i32,
@@ -295,7 +327,7 @@ impl Tower {
     /// Builds an elevator shaft spanning the inclusive floor range.
     ///
     /// Fails if the range is reversed, either endpoint does not exist, the column is outside the
-    /// tower, or an existing room occupies that column on a spanned floor.
+    /// tower, or an existing room or floor segment occupies its column on a spanned floor.
     pub fn build_elevator_shaft(
         &mut self,
         column: u32,
@@ -392,6 +424,7 @@ mod tests {
         floor_number: i32,
         columns: std::ops::Range<u32>,
     ) {
+        // Use ground-floor lobbies as supports, then build the requested columns above them.
         for column in columns {
             tower
                 .build_room(0, column, RoomType::Lobby)
@@ -683,7 +716,7 @@ mod tests {
             .expect("room should build");
 
         assert!(matches!(
-            tower            .build_elevator_shaft(12, 1, 1),
+            tower.build_elevator_shaft(12, 1, 1),
             Err(TowerError::ElevatorOverlapsRoom {
                 room_id: overlapping_id,
                 floor: 1
@@ -691,8 +724,8 @@ mod tests {
         ));
     }
 
-    #[test]
     /// A room added to a floor can later be removed by its ID.
+    #[test]
     fn built_room_can_be_removed_by_its_id() {
         let mut tower = Tower::default();
         build_supported_segments(&mut tower, 1, 0..16);
