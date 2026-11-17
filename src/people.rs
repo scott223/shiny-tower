@@ -13,5 +13,5 @@ pub struct Person {
     /// Display name.
     pub name: String,
     /// Floor the person is currently on.
-    pub floor: u32,
+    pub floor: i32,
 }

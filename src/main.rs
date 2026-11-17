@@ -1,4 +1,5 @@
 mod economy;
+mod elevator;
 pub mod messages;
 mod people;
 mod renderer;

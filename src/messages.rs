@@ -9,10 +9,12 @@ pub enum RendererWorkerMessage {
     /// Sent by the worker after it successfully builds a room.
     RoomBuilt {
         id: RoomId,
-        floor: u32,
+        floor: i32,
         x: u32,
         room_type: RoomType,
     },
+    /// Sent by the worker after it successfully builds a floor segment.
+    FloorSegmentBuilt { floor: i32, column: u32 },
     /// Sent by the worker after it successfully destroys a room.
     RoomRemoved(RoomId),
     /// Stops the receiving renderer or worker loop.
@@ -24,11 +26,13 @@ pub enum RendererWorkerMessage {
 pub enum UiInput {
     /// Request a room be built on a floor.
     BuildRoom {
-        floor: u32,
-        /// The room's horizontal position on the floor, in tiles.
+        floor: i32,
+        /// The room's column position on the floor.
         x: u32,
         room_type: RoomType,
     },
+    /// Request a floor segment be built at a column.
+    BuildFloorSegment { floor: i32, column: u32 },
     /// Request a room be destroyed by ID.
     RemoveRoom(RoomId),
 }

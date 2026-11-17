@@ -20,6 +20,9 @@ pub fn run(
             Ok(message @ RendererWorkerMessage::RoomBuilt { .. }) => {
                 eprintln!("renderer received room-built update: {message:?}");
             }
+            Ok(message @ RendererWorkerMessage::FloorSegmentBuilt { .. }) => {
+                eprintln!("renderer received floor-segment-built update: {message:?}");
+            }
             Ok(RendererWorkerMessage::RoomRemoved(room_id)) => {
                 eprintln!("renderer received room-removed update: {room_id:?}");
             }
