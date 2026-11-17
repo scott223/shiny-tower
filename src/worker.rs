@@ -27,6 +27,7 @@ pub fn run(
                             Ok(cost) => cost,
                             Err(error) => {
                                 eprintln!("could not build room: {error:?}");
+                                // Invalid placements cannot be priced, so skip this request.
                                 continue;
                             }
                         };
@@ -57,10 +58,12 @@ pub fn run(
                         }
                     }
                     Err(error) => {
+                        // A poisoned mutex means shared game state can no longer be trusted.
                         eprintln!("game state lock poisoned: {error}");
                         break;
                     }
                 };
+                // Send only after releasing the game-state lock.
                 if let Some(message) = built_room {
                     send_message(&to_renderer, message);
                 }
@@ -77,6 +80,7 @@ pub fn run(
                             );
                             None
                         } else {
+                            // Charge only if the tower accepts the segment placement.
                             match state.building.build_floor_segment(floor, column) {
                                 Ok(()) => {
                                     state.economy.cash -= FLOOR_SEGMENT_COST;
@@ -90,10 +94,12 @@ pub fn run(
                         }
                     }
                     Err(error) => {
+                        // Stop rather than continue with potentially inconsistent shared state.
                         eprintln!("game state lock poisoned: {error}");
                         break;
                     }
                 };
+                // Publish successful state changes after the lock is released.
                 if let Some(message) = built_segment {
                     send_message(&to_renderer, message);
                 }
@@ -109,6 +115,7 @@ pub fn run(
                         }
                     },
                     Err(error) => {
+                        // Stop rather than process further requests against poisoned state.
                         eprintln!("game state lock poisoned: {error}");
                         break;
                     }
@@ -128,7 +135,7 @@ pub fn run(
         }
     }
 
-    // Signal that no further worker-to-renderer messages will be sent.
+    // Close the worker-to-renderer stream explicitly when input shuts down or disconnects.
     send_message(&to_renderer, RendererWorkerMessage::Shutdown);
 }
 
@@ -159,6 +166,7 @@ mod tests {
     #[test]
     fn building_room_deducts_its_cost_from_cash() {
         let mut building = Tower::default();
+        // Prebuild the room's full support footprint so only the room cost is charged.
         for column in 0..16 {
             building
                 .build_floor_segment(0, column)

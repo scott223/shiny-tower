@@ -65,6 +65,7 @@ impl Default for Tower {
 
 impl Tower {
     fn column_has_support_below(&self, floor_number: i32, column: u32) -> Result<bool, TowerError> {
+        // Support must come from the immediately lower floor, not any floor further below.
         let below_floor_number = floor_number
             .checked_sub(1)
             .ok_or(TowerError::FloorNotFound(floor_number))?;
@@ -73,7 +74,11 @@ impl Tower {
             .iter()
             .find(|floor| floor.number == below_floor_number)
             .ok_or(TowerError::FloorNotFound(below_floor_number))?;
+
+        // A prebuilt segment supports exactly its own column.
         let supported_by_segment = below_floor.floor_segments.contains(&column);
+
+        // Rooms support every column in their half-open horizontal footprint.
         let supported_by_room = below_floor
             .rooms
             .iter()
@@ -83,6 +88,8 @@ impl Tower {
                 let room_right = room_left + u64::from(room.room_type.properties().width);
                 room_left <= u64::from(column) && u64::from(column) < room_right
             });
+
+        // Either kind of structure on the lower floor is sufficient support.
         Ok(supported_by_segment || supported_by_room)
     }
 
@@ -94,26 +101,35 @@ impl Tower {
         floor_number: i32,
         column: u32,
     ) -> Result<(), TowerError> {
+        // Find the target first so later checks and insertion operate on a known floor.
         let floor_index = self
             .floors
             .iter()
             .position(|floor| floor.number == floor_number)
             .ok_or(TowerError::FloorNotFound(floor_number))?;
+
+        // Segments occupy a single column within the tower's fixed horizontal bounds.
         if column >= MAX_FLOOR_WIDTH_COLUMNS {
             return Err(TowerError::ColumnOutOfRange(column));
         }
+
+        // The modeled foundation begins at ground level; below-ground construction is unsupported.
         if floor_number < 0 {
             return Err(TowerError::FloorSegmentBelowGround {
                 floor: floor_number,
                 column,
             });
         }
+
+        // Do not create duplicate structure at the same floor and column.
         if self.floors[floor_index].floor_segments.contains(&column) {
             return Err(TowerError::FloorSegmentAlreadyExists {
                 floor: floor_number,
                 column,
             });
         }
+
+        // Elevator shafts reserve their column throughout their inclusive floor range.
         if self.elevator_shafts.values().any(|elevator| {
             elevator.start_floor <= floor_number
                 && floor_number <= elevator.end_floor
@@ -125,6 +141,7 @@ impl Tower {
             });
         }
 
+        // Ground segments sit directly on the foundation; upper segments need support below.
         if floor_number > 0 {
             if !self.column_has_support_below(floor_number, column)? {
                 return Err(TowerError::FloorSegmentUnsupported {
@@ -134,24 +151,29 @@ impl Tower {
             }
         }
 
+        // Commit only after all placement and support checks pass.
         self.floors[floor_index].floor_segments.push(column);
         Ok(())
     }
 
+    /// Validates a proposed room placement without mutating the tower.
+    ///
+    /// Returns the target floor and the supported floor segments that construction would need
+    /// to add. Callers can use this plan to determine cost before committing the build.
     fn plan_room_build(
         &self,
         floor_number: i32,
         x: u32,
         room_type: RoomType,
     ) -> Result<RoomBuildPlan, TowerError> {
-        // Resolve the target floor before validating placement.
+        // Resolve the target floor once and retain its index for cost calculation and insertion.
         let floor_index = self
             .floors
             .iter()
             .position(|floor| floor.number == floor_number)
             .ok_or(TowerError::FloorNotFound(floor_number))?;
 
-        // Lobby only on ground floor and every 15th floor
+        // Lobbies are limited to ground level and positive multiples of 15.
         if room_type == RoomType::Lobby && (floor_number < 0 || floor_number % 15 != 0) {
             return Err(TowerError::LobbyOnlyAllowedOnEveryFifteenthFloor {
                 floor: floor_number,
@@ -159,13 +181,13 @@ impl Tower {
         }
 
         let width = room_type.properties().width;
-        // Use a right-exclusive edge to match the overlap check below.
+        // Check the room's entire horizontal footprint using a right-exclusive edge.
         let right_edge = i64::from(x) + i64::from(width);
         if right_edge > i64::from(MAX_FLOOR_WIDTH_COLUMNS) {
             return Err(TowerError::RoomExceedsFloorWidth { x, width });
         }
 
-        // Elevator shafts occupy their column on every floor in the inclusive range.
+        // Reject any footprint that contains a shaft's column on this floor.
         if let Some(elevator) = self.elevator_shafts.values().find(|elevator| {
             elevator.start_floor <= floor_number
                 && floor_number <= elevator.end_floor
@@ -177,6 +199,8 @@ impl Tower {
             });
         }
 
+        // Plan segments for the whole room footprint. Ground is supported by the foundation;
+        // higher floors need existing room or segment support directly underneath each column.
         let mut missing_segments = Vec::new();
         for column in x..x + width {
             if !self.floors[floor_index].floor_segments.contains(&column) {
@@ -196,7 +220,7 @@ impl Tower {
             }
         }
 
-        // Rooms occupy [x, right_edge); touching edges are allowed, shared columns are not.
+        // Check existing room footprints; touching edges are allowed, shared columns are not.
         if let Some(overlapping_room) =
             self.floors[floor_index]
                 .rooms
@@ -215,6 +239,7 @@ impl Tower {
             return Err(TowerError::RoomOverlap(overlapping_room));
         }
 
+        // Return the validated changes for the caller to price or commit.
         Ok(RoomBuildPlan {
             floor_index,
             missing_segments,
@@ -269,26 +294,33 @@ impl Tower {
         start_floor: i32,
         end_floor: i32,
     ) -> Result<ElevatorId, TowerError> {
+        // The shaft range includes both endpoints and must run from lower to higher floor.
         if start_floor > end_floor {
             return Err(TowerError::InvalidElevatorFloorRange {
                 start_floor,
                 end_floor,
             });
         }
+
+        // Elevator columns use the same zero-based bounds as rooms and floor segments.
         if column >= MAX_FLOOR_WIDTH_COLUMNS {
             return Err(TowerError::ColumnOutOfRange(column));
         }
+
+        // Validate both endpoints; the tower's floors are contiguous, so these bound the range.
         for floor_number in [start_floor, end_floor] {
             if !self.floors.iter().any(|floor| floor.number == floor_number) {
                 return Err(TowerError::FloorNotFound(floor_number));
             }
         }
 
+        // A shaft reserves its column on every floor in the inclusive range.
         for floor in self
             .floors
             .iter()
             .filter(|floor| start_floor <= floor.number && floor.number <= end_floor)
         {
+            // A room conflicts if its horizontal footprint contains the shaft column.
             for room_id in &floor.rooms {
                 let Some(room) = self.rooms.get(*room_id) else {
                     continue;
@@ -302,6 +334,8 @@ impl Tower {
                     });
                 }
             }
+
+            // Floor segments also occupy columns, so the shaft cannot pass through one.
             if floor.floor_segments.contains(&column) {
                 return Err(TowerError::FloorSegmentOverlapsElevator {
                     floor: floor.number,
@@ -310,6 +344,7 @@ impl Tower {
             }
         }
 
+        // Insert only after every floor in the span passes collision validation.
         Ok(self.elevator_shafts.insert(ElevatorShaft {
             column,
             start_floor,
