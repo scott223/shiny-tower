@@ -36,8 +36,11 @@ pub fn run(
 
         loop {
             match from_simulation.try_recv() {
-                Ok(SimulationRendererMessage::Tick(tick)) => {
-                    eprintln!("renderer received simulation tick: {tick}");
+                Ok(SimulationRendererMessage::Tick { tick, date, time }) => {
+                    eprintln!(
+                        "simulation tick {tick}: time {:02}:{:02} ({:?}), day of week {:?}, quarter Q{} (year {})",
+                        time.hour, time.minute, time.period, date.day_type, date.quarter, date.year
+                    );
                 }
                 Ok(SimulationRendererMessage::Shutdown) => simulation_stopped = true,
                 Err(TryRecvError::Empty) => break,

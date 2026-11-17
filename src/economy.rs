@@ -2,7 +2,7 @@
 /// The tower's current balance.
 pub struct Economy {
     /// Available funds.
-    pub cash: i64,
+    pub cash: u64,
 }
 
 impl Default for Economy {

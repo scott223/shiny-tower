@@ -40,10 +40,51 @@ pub enum UiInput {
 /// Simulation updates sent directly from the simulation thread to the renderer.
 #[derive(Debug)]
 pub enum SimulationRendererMessage {
-    /// Indicates that the simulation thread completed a tick.
-    Tick(u64),
+    /// Indicates that the simulation thread completed a tick with its corresponding date and time.
+    Tick {
+        tick: u64,
+        date: SimulationDate,
+        time: SimulationTime,
+    },
     /// Stops the renderer's simulation-update receiver.
     Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Time of day derived from the simulation tick.
+pub struct SimulationTime {
+    pub hour: u8,
+    pub minute: u8,
+    pub period: TimeOfDayPeriod,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Period of the day associated with a simulation time.
+pub enum TimeOfDayPeriod {
+    Day,
+    Dusk,
+    Night,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Position of a day within each three-day quarter.
+pub enum SimulationDayType {
+    Weekday1,
+    Weekday2,
+    Weekend,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Calendar date derived from the running day counter.
+pub struct SimulationDate {
+    /// Zero-based day counter suitable for saving and restoring the date.
+    pub day_counter: u64,
+    /// Day type within the quarter.
+    pub day_type: SimulationDayType,
+    /// One-based quarter within the year.
+    pub quarter: u8,
+    /// One-based year number.
+    pub year: u64,
 }
 
 /// Sends a typed message and reports if its receiving channel has closed.

@@ -221,9 +221,12 @@ impl Tower {
         room_type: RoomType,
     ) -> Result<u64, TowerError> {
         let plan = self.plan_room_build(floor_number, x, room_type)?;
-        let missing_segment_count = u64::try_from(plan.missing_segments.len())
-            .expect("room width is bounded by the floor width");
-        Ok(room_type.properties().cost + missing_segment_count * FLOOR_SEGMENT_COST)
+        let missing_segment_cost = plan
+            .missing_segments
+            .iter()
+            .map(|_| FLOOR_SEGMENT_COST)
+            .sum::<u64>();
+        Ok(room_type.properties().cost + missing_segment_cost)
     }
 
     /// Creates a room at the given floor and column.

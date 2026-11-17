@@ -17,9 +17,12 @@ pub fn run(
                 x,
                 room_type,
             }) => {
-                // Notify the renderer only after the room was successfully added to the tower.
+                // Keep cost validation, construction, and payment atomic with respect to other
+                // state users by doing them under the same lock.
                 let built_room = match game_state.lock() {
                     Ok(mut state) => {
+                        // Planning validates placement and counts only the floor segments that
+                        // construction would need to add.
                         let total_cost = match state.building.room_build_cost(floor, x, room_type) {
                             Ok(cost) => cost,
                             Err(error) => {
@@ -27,23 +30,18 @@ pub fn run(
                                 continue;
                             }
                         };
-                        let cost = match i64::try_from(total_cost) {
-                            Ok(cost) => cost,
-                            Err(error) => {
-                                eprintln!("room construction cost is out of range: {error}");
-                                continue;
-                            }
-                        };
-                        if state.economy.cash < cost {
+                        if state.economy.cash < total_cost {
                             eprintln!(
-                                "insufficient cash to build room: need {cost}, have {}",
+                                "insufficient cash to build room: need {total_cost}, have {}",
                                 state.economy.cash
                             );
                             None
                         } else {
+                            // The plan has succeeded and funds are available; mutate the tower
+                            // first, then charge only after construction succeeds.
                             match state.building.build_room(floor, x, room_type) {
                                 Ok(room_id) => {
-                                    state.economy.cash -= cost;
+                                    state.economy.cash -= total_cost;
                                     Some(RendererWorkerMessage::RoomBuilt {
                                         id: room_id,
                                         floor,
@@ -68,20 +66,20 @@ pub fn run(
                 }
             }
             RendererWorkerMessage::UiInput(UiInput::BuildFloorSegment { floor, column }) => {
+                // Standalone floor segments have a fixed cost; validate funds before asking the
+                // tower to apply its placement and support rules.
                 let built_segment = match game_state.lock() {
                     Ok(mut state) => {
-                        let cost = i64::try_from(FLOOR_SEGMENT_COST)
-                            .expect("floor segment cost fits in the cash type");
-                        if state.economy.cash < cost {
+                        if state.economy.cash < FLOOR_SEGMENT_COST {
                             eprintln!(
-                                "insufficient cash to build floor segment: need {cost}, have {}",
+                                "insufficient cash to build floor segment: need {FLOOR_SEGMENT_COST}, have {}",
                                 state.economy.cash
                             );
                             None
                         } else {
                             match state.building.build_floor_segment(floor, column) {
                                 Ok(()) => {
-                                    state.economy.cash -= cost;
+                                    state.economy.cash -= FLOOR_SEGMENT_COST;
                                     Some(RendererWorkerMessage::FloorSegmentBuilt { floor, column })
                                 }
                                 Err(error) => {
@@ -101,7 +99,7 @@ pub fn run(
                 }
             }
             RendererWorkerMessage::UiInput(UiInput::RemoveRoom(room_id)) => {
-                // Remove the room from state before emitting its renderer update.
+                // Update authoritative state before telling the renderer to remove its display.
                 let removed = match game_state.lock() {
                     Ok(mut state) => match state.building.remove_room(room_id) {
                         Ok(_) => true,
@@ -122,6 +120,8 @@ pub fn run(
             RendererWorkerMessage::RoomBuilt { .. }
             | RendererWorkerMessage::FloorSegmentBuilt { .. }
             | RendererWorkerMessage::RoomRemoved(_) => {
+                // These variants are worker outputs, so receiving them here indicates a
+                // direction/protocol error rather than a user action.
                 eprintln!("unexpected renderer output received by worker");
             }
             RendererWorkerMessage::Shutdown => break,
@@ -145,6 +145,7 @@ mod tests {
         let (input_sender, input_receiver) = mpsc::channel();
         let (output_sender, output_receiver) = mpsc::channel();
         let worker = thread::spawn(move || run(input_receiver, state, output_sender));
+        // Shut down after one request so each test can inspect the resulting state and messages.
         input_sender
             .send(RendererWorkerMessage::UiInput(input))
             .expect("worker should receive the request");
@@ -275,7 +276,7 @@ mod tests {
     fn building_floor_segment_deducts_its_cost_and_checks_cash() {
         let state = Arc::new(Mutex::new(GameState {
             economy: crate::economy::Economy {
-                cash: FLOOR_SEGMENT_COST as i64,
+                cash: FLOOR_SEGMENT_COST,
                 ..Default::default()
             },
             ..Default::default()
@@ -308,7 +309,7 @@ mod tests {
 
         let state = Arc::new(Mutex::new(GameState {
             economy: crate::economy::Economy {
-                cash: FLOOR_SEGMENT_COST as i64 - 1,
+                cash: FLOOR_SEGMENT_COST - 1,
                 ..Default::default()
             },
             ..Default::default()
@@ -322,7 +323,7 @@ mod tests {
         );
 
         let state = state.lock().unwrap();
-        assert_eq!(state.economy.cash, FLOOR_SEGMENT_COST as i64 - 1);
+        assert_eq!(state.economy.cash, FLOOR_SEGMENT_COST - 1);
         assert!(state.building.floors[10].floor_segments.is_empty());
         drop(state);
         assert!(matches!(

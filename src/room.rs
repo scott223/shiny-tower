@@ -23,8 +23,8 @@ pub struct RoomProperties {
     pub cost: u64,
     /// One-time profit earned when the room is built.
     pub profit_instant: u64,
-    /// Recurring profit earned each week.
-    pub profit_weekly: u64,
+    /// Recurring profit earned each quarter.
+    pub profit_quarterly: u64,
 }
 
 impl RoomType {
@@ -36,28 +36,28 @@ impl RoomType {
                 height: 1,
                 cost: 100,
                 profit_instant: 200,
-                profit_weekly: 0,
+                profit_quarterly: 0,
             },
             Self::PartyHall => RoomProperties {
                 width: 24,
                 height: 2,
                 cost: 500,
                 profit_instant: 0,
-                profit_weekly: 0,
+                profit_quarterly: 0,
             },
             Self::Lobby => RoomProperties {
                 width: 1,
                 height: 1,
                 cost: 150,
                 profit_instant: 0,
-                profit_weekly: 0,
+                profit_quarterly: 0,
             },
             Self::Office => RoomProperties {
                 width: 9,
                 height: 1,
                 cost: 250,
                 profit_instant: 0,
-                profit_weekly: 50,
+                profit_quarterly: 50,
             },
         }
     }
