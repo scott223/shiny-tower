@@ -1,11 +1,11 @@
 //! Bevy scene, HUD, and input handling for the tower renderer.
-use crate::messages::{
+use shiny_tower::messages::{
     RendererWorkerMessage, SimulationDate, SimulationDayType, SimulationRendererMessage,
     SimulationSpeed, SimulationTime, TimeOfDayPeriod, UiInput,
 };
-use crate::room::{RoomId, RoomType};
-use crate::steps::StepsId;
-use crate::tower::{FLOORS_ABOVE_GROUND, FLOORS_BELOW_GROUND, MAX_FLOOR_WIDTH_COLUMNS};
+use shiny_tower::room::{RoomId, RoomType};
+use shiny_tower::steps::StepsId;
+use shiny_tower::tower::{FLOORS_ABOVE_GROUND, FLOORS_BELOW_GROUND, MAX_FLOOR_WIDTH_COLUMNS};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
@@ -747,8 +747,8 @@ fn room_position(floor: i32, x: u32, room_type: RoomType) -> Vec2 {
 
 fn steps_dimensions() -> Vec2 {
     Vec2::new(
-        crate::steps::Steps::WIDTH as f32 * COLUMN_WIDTH,
-        crate::steps::Steps::HEIGHT as f32 * FLOOR_HEIGHT - FLOOR_THICKNESS,
+        shiny_tower::steps::Steps::WIDTH as f32 * COLUMN_WIDTH,
+        shiny_tower::steps::Steps::HEIGHT as f32 * FLOOR_HEIGHT - FLOOR_THICKNESS,
     )
 }
 

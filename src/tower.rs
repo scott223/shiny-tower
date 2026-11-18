@@ -76,6 +76,8 @@ pub enum TowerError {
     RoomOverlap(RoomId),
     /// The elevator's start floor is above its end floor.
     InvalidElevatorFloorRange { start_floor: i32, end_floor: i32 },
+    /// The proposed steps intersect an existing set of steps.
+    StepsOverlap(StepsId),
     /// Steps would overlap an elevator shaft.
     StepsOverlapElevator { column: u32, floor: i32 },
     /// An elevator shaft would overlap steps.
@@ -399,7 +401,8 @@ impl Tower {
     /// Builds steps eight columns wide from `start_floor` through the floor above.
     ///
     /// The full footprint must already have rooms or floor segments on both floors. Steps may
-    /// overlap rooms but not an elevator shaft, and do not add floor segments.
+    /// overlap rooms but not an elevator shaft or another set of steps, and do not add floor
+    /// segments.
     pub fn build_steps(&mut self, x: u32, start_floor: i32) -> Result<StepsId, TowerError> {
         let end_floor = start_floor
             .checked_add(Steps::HEIGHT - 1)
@@ -429,6 +432,18 @@ impl Tower {
                 column: elevator.column,
                 floor,
             });
+        }
+
+        if let Some((steps_id, _)) = self.steps.iter().find(|(_, existing)| {
+            let existing_end_floor = existing.start_floor + Steps::HEIGHT - 1;
+            let existing_right_edge = u64::from(existing.x) + u64::from(Steps::WIDTH);
+
+            existing.start_floor <= end_floor
+                && start_floor <= existing_end_floor
+                && u64::from(x) < existing_right_edge
+                && u64::from(existing.x) < right_edge
+        }) {
+            return Err(TowerError::StepsOverlap(steps_id));
         }
 
         for floor_number in start_floor..=end_floor {
@@ -882,6 +897,32 @@ mod tests {
         assert_eq!(Steps::WIDTH, 8);
         assert_eq!(Steps::HEIGHT, 2);
         assert_eq!(Steps::COST, 5_000);
+    }
+
+    #[test]
+    fn steps_cannot_overlap_other_steps_but_adjacent_steps_are_allowed() {
+        let mut tower = Tower::default();
+        build_supported_segments(&mut tower, 3, 0..32);
+
+        let first = tower
+            .build_steps(4, 1)
+            .expect("first set of steps should build");
+        assert_eq!(
+            tower.build_steps(8, 1),
+            Err(TowerError::StepsOverlap(first))
+        );
+        assert_eq!(
+            tower.build_steps(10, 2),
+            Err(TowerError::StepsOverlap(first))
+        );
+        assert!(
+            tower.build_steps(12, 1).is_ok(),
+            "steps sharing only an edge should not overlap"
+        );
+        assert!(
+            tower.build_steps(20, 1).is_ok(),
+            "steps on separate horizontal footprints should be allowed"
+        );
     }
 
     #[test]
