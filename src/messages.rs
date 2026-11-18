@@ -85,6 +85,7 @@ pub struct SimulationTime {
 pub enum TimeOfDayPeriod {
     Day,
     Dusk,
+    Dawn,
     Night,
 }
 

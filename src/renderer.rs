@@ -1,11 +1,5 @@
 //! Bevy scene, HUD, and input handling for the tower renderer.
-use shiny_tower::messages::{
-    RendererWorkerMessage, SimulationDate, SimulationDayType, SimulationRendererMessage,
-    SimulationSpeed, SimulationTime, TimeOfDayPeriod, UiInput,
-};
-use shiny_tower::room::{RoomId, RoomType};
-use shiny_tower::steps::StepsId;
-use shiny_tower::tower::{FLOORS_ABOVE_GROUND, FLOORS_BELOW_GROUND, MAX_FLOOR_WIDTH_COLUMNS};
+use bevy::input::gestures::PinchGesture;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
@@ -13,12 +7,20 @@ use bevy::transform::TransformSystems;
 use bevy::ui::Pressed;
 use bevy::ui_widgets::{Activate, Button};
 use bevy::window::PrimaryWindow;
+use shiny_tower::messages::{
+    RendererWorkerMessage, SimulationDate, SimulationDayType, SimulationRendererMessage,
+    SimulationSpeed, SimulationTime, TimeOfDayPeriod, UiInput,
+};
+use shiny_tower::room::{RoomId, RoomType};
+use shiny_tower::steps::StepsId;
+use shiny_tower::tower::{FLOORS_ABOVE_GROUND, FLOORS_BELOW_GROUND, MAX_FLOOR_WIDTH_COLUMNS};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 // Tower positions are converted from columns and floors into these world-space units.
 const COLUMN_WIDTH: f32 = 8.0;
-const FLOOR_HEIGHT: f32 = 24.0;
+const FLOOR_HEIGHT: f32 = 32.0; // 24px room height plus the 8px ceiling/floor segment.
 const FLOOR_THICKNESS: f32 = 8.0;
 
 // Camera movement, depth, and zoom limits.
@@ -40,6 +42,10 @@ const ROOM_MENU_WIDTH: f32 = 190.0;
 const ROOM_MENU_HEIGHT: f32 = 390.0;
 const ERROR_TOOLTIP_WIDTH: f32 = 300.0;
 const ERROR_TOOLTIP_HEIGHT: f32 = 72.0;
+const CONDO_SHEET_SIZE: UVec2 = UVec2::new(688, 128);
+const CONDO_FRAME_SIZE: UVec2 = UVec2::new(128, 24);
+const CONDO_FRAME_Y: u32 = 8;
+const CONDO_FRAME_X: [u32; 3] = [8, 144, 280];
 
 /// Message endpoints shared by renderer systems.
 ///
@@ -93,6 +99,25 @@ struct PlacementState {
     request_pending: bool,
     last_click_position: Vec2,
     error: Option<String>,
+    room_drag_origin: Option<(i32, u32, RoomType)>,
+    room_drag_last_target: Option<(i32, u32)>,
+    visited_room_targets: HashSet<(i32, u32)>,
+    queued_room_builds: VecDeque<RoomBuildRequest>,
+}
+
+impl PlacementState {
+    fn is_busy(&self) -> bool {
+        self.request_pending
+            || !self.queued_room_builds.is_empty()
+            || self.room_drag_origin.is_some()
+    }
+}
+
+struct RoomBuildRequest {
+    floor: i32,
+    x: u32,
+    room_type: RoomType,
+    cursor_position: Vec2,
 }
 
 impl Default for SimulationClock {
@@ -124,7 +149,15 @@ struct TowerCamera;
 #[derive(Component)]
 struct HudText;
 
-/// Associates a rendered room entity with its simulation identifier.
+#[derive(Resource, Default)]
+struct RoomSpriteSheets(HashMap<RoomType, RoomSpriteSheet>);
+
+struct RoomSpriteSheet {
+    image: Handle<Image>,
+    layout: Handle<TextureAtlasLayout>,
+}
+
+/// Associates a rendered room entity with its simulation data.
 #[derive(Component)]
 struct RoomVisual(RoomId);
 
@@ -172,7 +205,7 @@ pub fn run(
         })
         .init_resource::<PlacementState>()
         .add_plugins(DefaultPlugins)
-        .add_systems(Startup, (setup_scene, setup_hud))
+        .add_systems(Startup, (setup_scene, setup_hud, setup_room_assets))
         .add_systems(
             Update,
             (
@@ -187,7 +220,10 @@ pub fn run(
         )
         .add_systems(
             PostUpdate,
-            update_placement_preview.after(TransformSystems::Propagate),
+            (
+                update_placement_preview.after(TransformSystems::Propagate),
+                dispatch_room_build_queue.after(update_placement_preview),
+            ),
         )
         .run();
 
@@ -244,6 +280,33 @@ fn setup_scene(mut commands: Commands, window: Single<&Window, With<PrimaryWindo
         Visibility::Hidden,
         PlacementPreview,
     ));
+}
+
+fn setup_room_assets(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
+) {
+    let image = asset_server.load("rooms/condos.png");
+    let layout = atlas_layouts.add(condo_atlas_layout());
+    commands.insert_resource(RoomSpriteSheets(HashMap::from([(
+        RoomType::Condo,
+        RoomSpriteSheet { image, layout },
+    )])));
+}
+
+fn condo_atlas_layout() -> TextureAtlasLayout {
+    let mut layout = TextureAtlasLayout::new_empty(CONDO_SHEET_SIZE);
+    for frame_x in CONDO_FRAME_X {
+        layout.add_texture(URect {
+            min: UVec2::new(frame_x, CONDO_FRAME_Y),
+            max: UVec2::new(
+                frame_x + CONDO_FRAME_SIZE.x,
+                CONDO_FRAME_Y + CONDO_FRAME_SIZE.y,
+            ),
+        });
+    }
+    layout
 }
 
 /// Builds the fixed HUD, speed controls, room menu, and error tooltip.
@@ -379,7 +442,7 @@ fn setup_hud(mut commands: Commands, channels: Res<RendererChannels>) {
                 ))
                 .observe(
                     move |_activate: On<Activate>, mut placement: ResMut<PlacementState>| {
-                        if !placement.request_pending {
+                        if !placement.is_busy() {
                             placement.selected_build = Some(BuildSelection::Room(room_type));
                             placement.error = None;
                         }
@@ -417,7 +480,7 @@ fn setup_hud(mut commands: Commands, channels: Res<RendererChannels>) {
             ))
             .observe(
                 move |_activate: On<Activate>, mut placement: ResMut<PlacementState>| {
-                    if !placement.request_pending {
+                    if !placement.is_busy() {
                         placement.selected_build = Some(BuildSelection::Steps);
                         placement.error = None;
                     }
@@ -450,6 +513,7 @@ fn move_camera(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut mouse_wheel: MessageReader<MouseWheel>,
+    mut pinch_gestures: MessageReader<PinchGesture>,
     window: Single<&Window, With<PrimaryWindow>>,
     mut cameras: Query<(&mut Transform, &mut Projection), With<TowerCamera>>,
 ) {
@@ -482,6 +546,7 @@ fn move_camera(
         };
         scroll_delta += Vec2::new(event.x, event.y) * unit_scale;
     }
+    let pinch_delta = pinch_gestures.read().map(|gesture| gesture.0).sum::<f32>();
 
     let (map_min, map_max) = map_bounds();
     let cursor_position = window.cursor_position();
@@ -495,8 +560,9 @@ fn move_camera(
                 transform.translation += direction.normalize() * speed;
             }
 
-            if zoom_direction != 0.0 {
-                let zoom_factor = (CAMERA_ZOOM_RATE * time.delta_secs() * zoom_direction).exp();
+            let zoom_factor = (CAMERA_ZOOM_RATE * time.delta_secs() * zoom_direction).exp()
+                * pinch_zoom_factor(pinch_delta);
+            if zoom_factor != 1.0 {
                 zoom_camera(
                     &mut transform,
                     orthographic,
@@ -520,6 +586,10 @@ fn move_camera(
             );
         }
     }
+}
+
+fn pinch_zoom_factor(delta: f32) -> f32 {
+    (-CAMERA_ZOOM_RATE * delta).exp()
 }
 
 /// Changes zoom while keeping the world point under the cursor stationary.
@@ -621,7 +691,7 @@ fn clamp_camera_to_map(
         .clamp(map_min.y + half_view.y, map_max.y - half_view.y);
 }
 
-/// Positions the cursor preview and sends a build request on click.
+/// Positions the cursor preview and records room builds while dragging.
 fn update_placement_preview(
     window: Single<&Window, With<PrimaryWindow>>,
     camera_query: Single<(&Camera, &GlobalTransform), With<TowerCamera>>,
@@ -630,6 +700,12 @@ fn update_placement_preview(
     mut placement: ResMut<PlacementState>,
     mut previews: Query<(&mut Sprite, &mut Transform, &mut Visibility), With<PlacementPreview>>,
 ) {
+    if !mouse.pressed(MouseButton::Left) {
+        placement.room_drag_origin = None;
+        placement.room_drag_last_target = None;
+        placement.visited_room_targets.clear();
+    }
+
     let Some(build_selection) = placement.selected_build else {
         for (_, _, mut visibility) in &mut previews {
             *visibility = Visibility::Hidden;
@@ -637,6 +713,7 @@ fn update_placement_preview(
         return;
     };
     let Some(cursor_position) = window.cursor_position() else {
+        placement.room_drag_last_target = None;
         for (_, _, mut visibility) in &mut previews {
             *visibility = Visibility::Hidden;
         }
@@ -644,6 +721,7 @@ fn update_placement_preview(
     };
 
     if pointer_over_ui(cursor_position, window.size(), &placement) {
+        placement.room_drag_last_target = None;
         for (_, _, mut visibility) in &mut previews {
             *visibility = Visibility::Hidden;
         }
@@ -654,6 +732,7 @@ fn update_placement_preview(
     let world_position = match camera.viewport_to_world_2d(camera_transform, cursor_position) {
         Ok(position) => position,
         Err(_) => {
+            placement.room_drag_last_target = None;
             for (_, _, mut visibility) in &mut previews {
                 *visibility = Visibility::Hidden;
             }
@@ -662,22 +741,47 @@ fn update_placement_preview(
     };
 
     let Some((floor, column)) = world_to_grid(world_position) else {
+        placement.room_drag_last_target = None;
         for (_, _, mut visibility) in &mut previews {
             *visibility = Visibility::Hidden;
         }
         return;
     };
 
+    let drag_target = match build_selection {
+        BuildSelection::Room(room_type) if mouse.just_pressed(MouseButton::Left) => {
+            placement.room_drag_origin = Some((floor, column, room_type));
+            placement.room_drag_last_target = None;
+            placement.visited_room_targets.clear();
+            Some((floor, column))
+        }
+        BuildSelection::Room(room_type) if mouse.pressed(MouseButton::Left) => {
+            match placement.room_drag_origin {
+                Some((origin_floor, origin_column, origin_type)) if origin_type == room_type => {
+                    let target =
+                        room_drag_target(origin_floor, origin_column, floor, column, room_type);
+                    if target.is_none() {
+                        placement.room_drag_last_target = None;
+                    }
+                    target
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+
+    let (preview_floor, preview_column) = drag_target.unwrap_or((floor, column));
     let (build_size, build_color, build_position) = match build_selection {
         BuildSelection::Room(room_type) => (
             room_dimensions(room_type),
             room_preview_color(room_type),
-            room_position(floor, column, room_type),
+            room_position(preview_floor, preview_column, room_type),
         ),
         BuildSelection::Steps => (
             steps_dimensions(),
             Color::srgba(0.78, 0.65, 0.40, 0.5),
-            steps_position(floor, column),
+            steps_position(preview_floor, preview_column),
         ),
     };
     for (mut sprite, mut transform, mut visibility) in &mut previews {
@@ -687,17 +791,15 @@ fn update_placement_preview(
         *visibility = Visibility::Visible;
     }
 
-    if mouse.just_pressed(MouseButton::Left) && !placement.request_pending {
-        let message = match build_selection {
-            BuildSelection::Room(room_type) => RendererWorkerMessage::UiInput(UiInput::BuildRoom {
-                floor,
-                x: column,
-                room_type,
-            }),
-            BuildSelection::Steps => {
-                RendererWorkerMessage::UiInput(UiInput::BuildSteps { floor, x: column })
-            }
-        };
+    if let (BuildSelection::Room(room_type), Some(target)) = (build_selection, drag_target) {
+        enqueue_room_drag_path(&mut placement, target, room_type, cursor_position);
+    }
+
+    if mouse.just_pressed(MouseButton::Left)
+        && matches!(build_selection, BuildSelection::Steps)
+        && !placement.is_busy()
+    {
+        let message = RendererWorkerMessage::UiInput(UiInput::BuildSteps { floor, x: column });
         placement.last_click_position = cursor_position;
         placement.error = None;
         match channels.to_worker.send(message) {
@@ -705,6 +807,101 @@ fn update_placement_preview(
             Err(error) => {
                 placement.error = Some(format!("Could not send build request: {error}"));
             }
+        }
+    }
+}
+
+fn room_drag_target(
+    origin_floor: i32,
+    origin_column: u32,
+    floor: i32,
+    column: u32,
+    room_type: RoomType,
+) -> Option<(i32, u32)> {
+    let room_width = i64::from(room_type.properties().width);
+    let room_height = room_type.properties().height as i32;
+    if room_width == 0 || room_height == 0 {
+        return None;
+    }
+    let vertical_steps = (floor - origin_floor) / room_height;
+    let target_floor = origin_floor + vertical_steps * room_height;
+    let horizontal_steps = (i64::from(column) - i64::from(origin_column)) / room_width;
+    let target_column = i64::from(origin_column) + horizontal_steps * room_width;
+    u32::try_from(target_column)
+        .ok()
+        .map(|column| (target_floor, column))
+}
+
+fn enqueue_room_drag_path(
+    placement: &mut PlacementState,
+    target: (i32, u32),
+    room_type: RoomType,
+    cursor_position: Vec2,
+) {
+    let path = placement.room_drag_last_target.map_or_else(
+        || vec![target],
+        |last| room_drag_path(last, target, room_type),
+    );
+    for (floor, x) in path {
+        if placement.visited_room_targets.insert((floor, x)) {
+            placement.queued_room_builds.push_back(RoomBuildRequest {
+                floor,
+                x,
+                room_type,
+                cursor_position,
+            });
+        }
+    }
+    placement.room_drag_last_target = Some(target);
+}
+
+fn room_drag_path(from: (i32, u32), to: (i32, u32), room_type: RoomType) -> Vec<(i32, u32)> {
+    let room_width = i64::from(room_type.properties().width);
+    let room_height = room_type.properties().height as i32;
+    if room_width == 0 || room_height == 0 {
+        return Vec::new();
+    }
+
+    let vertical_steps = (to.0 - from.0) / room_height;
+    let horizontal_steps = (i64::from(to.1) - i64::from(from.1)) / room_width;
+    let step_count = vertical_steps
+        .abs()
+        .max(horizontal_steps.unsigned_abs() as i32);
+    let mut path = Vec::new();
+    for step in 1..=step_count {
+        let progress = step as f32 / step_count as f32;
+        let floor = from.0 + (vertical_steps as f32 * progress).round() as i32 * room_height;
+        let x_steps = (horizontal_steps as f32 * progress).round() as i64;
+        let x = i64::from(from.1) + x_steps * room_width;
+        if let Ok(x) = u32::try_from(x) {
+            path.push((floor, x));
+        }
+    }
+    path
+}
+
+fn dispatch_room_build_queue(
+    mut placement: ResMut<PlacementState>,
+    channels: Res<RendererChannels>,
+) {
+    if placement.request_pending {
+        return;
+    }
+    let Some(request) = placement.queued_room_builds.pop_front() else {
+        return;
+    };
+
+    placement.last_click_position = request.cursor_position;
+    placement.error = None;
+    let message = RendererWorkerMessage::UiInput(UiInput::BuildRoom {
+        floor: request.floor,
+        x: request.x,
+        room_type: request.room_type,
+    });
+    match channels.to_worker.send(message) {
+        Ok(()) => placement.request_pending = true,
+        Err(error) => {
+            placement.error = Some(format!("Could not send build request: {error}"));
         }
     }
 }
@@ -727,7 +924,7 @@ fn world_to_grid(position: Vec2) -> Option<(i32, u32)> {
     Some((floor as i32, column as u32))
 }
 
-/// Computes the rendered room size, leaving the floor thickness beneath it.
+/// Computes the rendered room size, leaving the ceiling thickness above it.
 fn room_dimensions(room_type: RoomType) -> Vec2 {
     let properties = room_type.properties();
     Vec2::new(
@@ -814,7 +1011,8 @@ fn receive_updates(
     mut clock: ResMut<SimulationClock>,
     mut placement: ResMut<PlacementState>,
     mut app_exit: MessageWriter<AppExit>,
-    rooms: Query<(Entity, &RoomVisual)>,
+    room_sheets: Res<RoomSpriteSheets>,
+    mut rooms: Query<(Entity, &RoomVisual, &mut Sprite)>,
 ) {
     // Drain both queues without blocking the render loop, so one producer cannot stall the other.
     let worker_messages = match channels.from_worker.lock() {
@@ -846,7 +1044,15 @@ fn receive_updates(
                 x,
                 room_type,
             } => {
-                spawn_room(&mut commands, id, floor, x, room_type);
+                spawn_room(
+                    &mut commands,
+                    id,
+                    floor,
+                    x,
+                    room_type,
+                    clock.time.period,
+                    &room_sheets,
+                );
                 placement.request_pending = false;
                 placement.error = None;
             }
@@ -868,7 +1074,7 @@ fn receive_updates(
             }
             RendererWorkerMessage::RoomRemoved(room_id) => {
                 // Removing a room leaves its floor structure in place.
-                for (entity, visual) in &rooms {
+                for (entity, visual, _) in &mut rooms {
                     if visual.0 == room_id {
                         commands.entity(entity).despawn();
                     }
@@ -917,6 +1123,12 @@ fn receive_updates(
                 clock.date = date;
                 clock.time = time;
                 clock.cash = cash;
+                let atlas_index = condo_atlas_index(time.period);
+                for (_, _, mut sprite) in &mut rooms {
+                    if let Some(atlas) = sprite.texture_atlas.as_mut() {
+                        atlas.index = atlas_index;
+                    }
+                }
             }
             SimulationRendererMessage::Shutdown => {
                 app_exit.write(AppExit::Success);
@@ -926,12 +1138,48 @@ fn receive_updates(
 }
 
 /// Creates the room sprite corresponding to a successful build message.
-fn spawn_room(commands: &mut Commands, id: RoomId, floor: i32, x: u32, room_type: RoomType) {
+fn spawn_room(
+    commands: &mut Commands,
+    id: RoomId,
+    floor: i32,
+    x: u32,
+    room_type: RoomType,
+    period: TimeOfDayPeriod,
+    room_sheets: &RoomSpriteSheets,
+) {
+    let mut sprite = if let Some(sheet) = room_sheets.0.get(&room_type) {
+        Sprite::from_atlas_image(
+            sheet.image.clone(),
+            TextureAtlas {
+                layout: sheet.layout.clone(),
+                index: condo_atlas_index(period),
+            },
+        )
+    } else {
+        Sprite::from_color(room_color(room_type), room_dimensions(room_type))
+    };
+    let mut position = room_position(floor, x, room_type);
+    if sprite.texture_atlas.is_some() {
+        sprite.custom_size = Some(Vec2::new(
+            CONDO_FRAME_SIZE.x as f32,
+            CONDO_FRAME_SIZE.y as f32,
+        ));
+        position.y = floor as f32 * FLOOR_HEIGHT + CONDO_FRAME_SIZE.y as f32 * 0.5;
+    }
+
     commands.spawn((
-        Sprite::from_color(room_color(room_type), room_dimensions(room_type)),
-        Transform::from_translation(room_position(floor, x, room_type).extend(2.0)),
+        sprite,
+        Transform::from_translation(position.extend(2.0)),
         RoomVisual(id),
     ));
+}
+
+fn condo_atlas_index(period: TimeOfDayPeriod) -> usize {
+    match period {
+        TimeOfDayPeriod::Day => 0,
+        TimeOfDayPeriod::Dusk | TimeOfDayPeriod::Dawn => 1,
+        TimeOfDayPeriod::Night => 2,
+    }
 }
 
 #[derive(Component)]
@@ -1178,6 +1426,12 @@ mod tests {
     }
 
     #[test]
+    fn pinch_magnification_zooms_in_and_shrinking_zooms_out() {
+        assert!(pinch_zoom_factor(0.1) < 1.0);
+        assert!(pinch_zoom_factor(-0.1) > 1.0);
+    }
+
+    #[test]
     fn pan_speed_decreases_slightly_when_zoomed_in() {
         let zoomed_in = camera_pan_speed_factor(CAMERA_MIN_SCALE);
         let halfway = camera_pan_speed_factor((CAMERA_MIN_SCALE + CAMERA_MAX_SCALE) * 0.5);
@@ -1227,16 +1481,65 @@ mod tests {
     }
 
     #[test]
+    fn room_drag_targets_advance_by_the_room_footprint() {
+        assert_eq!(room_drag_target(2, 5, 2, 20, RoomType::Condo), Some((2, 5)));
+        assert_eq!(
+            room_drag_target(2, 5, 2, 21, RoomType::Condo),
+            Some((2, 21))
+        );
+        assert_eq!(room_drag_target(2, 18, 2, 2, RoomType::Condo), Some((2, 2)));
+        assert_eq!(
+            room_drag_target(2, 5, 3, 5, RoomType::PartyHall),
+            Some((2, 5))
+        );
+        assert_eq!(
+            room_drag_target(2, 5, 4, 5, RoomType::PartyHall),
+            Some((4, 5))
+        );
+    }
+
+    #[test]
+    fn room_drag_path_includes_each_intermediate_footprint() {
+        assert_eq!(
+            room_drag_path((2, 5), (2, 53), RoomType::Condo),
+            vec![(2, 21), (2, 37), (2, 53)]
+        );
+        assert_eq!(
+            room_drag_path((1, 0), (5, 48), RoomType::PartyHall),
+            vec![(3, 24), (5, 48)]
+        );
+    }
+
+    #[test]
     fn rooms_fill_their_columns_and_rest_on_the_floor() {
         let room_type = RoomType::Condo;
         let size = room_dimensions(room_type);
         let position = room_position(2, 0, room_type);
 
         assert_eq!(size.x, room_type.properties().width as f32 * COLUMN_WIDTH);
+        assert_eq!(size.y, 24.0);
+        assert_eq!(FLOOR_HEIGHT, size.y + FLOOR_THICKNESS);
         assert_eq!(position.y - size.y * 0.5, 2.0 * FLOOR_HEIGHT);
         assert_eq!(
             room_position(2, room_type.properties().width, room_type).x - size.x * 0.5,
             size.x
         );
+    }
+
+    #[test]
+    fn condo_atlas_columns_follow_day_dusk_dawn_and_night() {
+        assert_eq!(condo_atlas_index(TimeOfDayPeriod::Day), 0);
+        assert_eq!(condo_atlas_index(TimeOfDayPeriod::Dusk), 1);
+        assert_eq!(condo_atlas_index(TimeOfDayPeriod::Dawn), 1);
+        assert_eq!(condo_atlas_index(TimeOfDayPeriod::Night), 2);
+    }
+
+    #[test]
+    fn condo_atlas_frames_are_cropped_to_the_visible_sprite_size() {
+        let layout = condo_atlas_layout();
+        assert_eq!(layout.textures.len(), 3);
+        for texture in layout.textures {
+            assert_eq!(texture.max - texture.min, CONDO_FRAME_SIZE);
+        }
     }
 }

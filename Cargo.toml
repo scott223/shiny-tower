@@ -18,4 +18,4 @@ required-features = ["renderer"]
 
 [dependencies]
 slotmap = "1.0"
-bevy = { version = "0.20.1", features = ["dynamic_linking"], optional = true }
+bevy = { version = "0.20.1", features = ["dynamic_linking", "gestures"], optional = true }

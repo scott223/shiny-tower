@@ -18,17 +18,18 @@ const DAYS_PER_YEAR: u64 = 12;
 const TICKS_PER_QUARTER: u64 = TICKS_PER_DAY * DAYS_PER_QUARTER;
 
 // Entries are (start tick, end tick, start minute, end minute, period); tick ranges are
-// start-inclusive and end-exclusive. The seven intervals map to 07:00–12:00 Day,
+// start-inclusive and end-exclusive. The eight intervals map to 07:00–12:00 Day,
 // 12:00–12:30 Day, 12:30–13:00 Day, 13:00–17:00 Day, 17:00–21:00 Dusk,
-// 21:00–01:00 Night, and 01:00–07:00 Night.
-const DAY_SCHEDULE: [(u64, u64, u64, u64, TimeOfDayPeriod); 7] = [
+// 21:00–01:00 Night, 01:00–05:00 Night, and 05:00–07:00 Dawn.
+const DAY_SCHEDULE: [(u64, u64, u64, u64, TimeOfDayPeriod); 8] = [
     (0, 400, 420, 720, TimeOfDayPeriod::Day), // 07:00–12:00 Day
     (400, 800, 720, 750, TimeOfDayPeriod::Day), // 12:00–12:30 Day
     (800, 1_200, 750, 780, TimeOfDayPeriod::Day), // 12:30–13:00 Day
     (1_200, 1_600, 780, 1_020, TimeOfDayPeriod::Day), // 13:00–17:00 Day
     (1_600, 2_000, 1_020, 1_260, TimeOfDayPeriod::Dusk), // 17:00–21:00 Dusk
     (2_000, 2_400, 1_260, 1_500, TimeOfDayPeriod::Night), // 21:00–01:00 Night
-    (2_400, 2_600, 60, 420, TimeOfDayPeriod::Night), // 01:00–07:00 Night
+    (2_400, 2_533, 60, 300, TimeOfDayPeriod::Night), // 01:00–05:00 Night
+    (2_533, 2_600, 300, 420, TimeOfDayPeriod::Dawn), // 05:00–07:00 Dawn
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -209,6 +210,7 @@ mod tests {
             (1_600, 17, 0),
             (2_000, 21, 0),
             (2_400, 1, 0),
+            (2_533, 5, 0),
             (2_600, 7, 0),
         ];
 
@@ -292,7 +294,8 @@ mod tests {
             (1_599, TimeOfDayPeriod::Day),
             (1_600, TimeOfDayPeriod::Dusk),
             (2_000, TimeOfDayPeriod::Night),
-            (2_599, TimeOfDayPeriod::Night),
+            (2_532, TimeOfDayPeriod::Night),
+            (2_533, TimeOfDayPeriod::Dawn),
         ];
 
         for (tick, period) in periods {
