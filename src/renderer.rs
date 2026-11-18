@@ -4,6 +4,7 @@ use crate::messages::{
     SimulationSpeed, SimulationTime, TimeOfDayPeriod, UiInput,
 };
 use crate::room::{RoomId, RoomType};
+use crate::steps::StepsId;
 use crate::tower::{FLOORS_ABOVE_GROUND, FLOORS_BELOW_GROUND, MAX_FLOOR_WIDTH_COLUMNS};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::picking::hover::Hovered;
@@ -36,7 +37,7 @@ const HUD_HEIGHT: f32 = 78.0;
 const ROOM_MENU_LEFT: f32 = 12.0;
 const ROOM_MENU_TOP: f32 = 90.0;
 const ROOM_MENU_WIDTH: f32 = 190.0;
-const ROOM_MENU_HEIGHT: f32 = 320.0;
+const ROOM_MENU_HEIGHT: f32 = 390.0;
 const ERROR_TOOLTIP_WIDTH: f32 = 300.0;
 const ERROR_TOOLTIP_HEIGHT: f32 = 72.0;
 
@@ -88,7 +89,7 @@ impl ActiveSpeed {
 /// Current room selection and status of the in-flight placement request.
 #[derive(Resource, Default)]
 struct PlacementState {
-    selected_room: Option<RoomType>,
+    selected_build: Option<BuildSelection>,
     request_pending: bool,
     last_click_position: Vec2,
     error: Option<String>,
@@ -127,13 +128,19 @@ struct HudText;
 #[derive(Component)]
 struct RoomVisual(RoomId);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuildSelection {
+    Room(RoomType),
+    Steps,
+}
+
 /// Stores the speed represented by a HUD speed button.
 #[derive(Component)]
 struct SpeedControlButton(SimulationSpeed);
 
-/// Stores the room type represented by a build-menu button.
+/// Stores the structure represented by a build-menu button.
 #[derive(Component)]
-struct RoomTypeButton(RoomType);
+struct BuildOptionButton(BuildSelection);
 
 /// Marks the sprite following the cursor during room placement.
 #[derive(Component)]
@@ -351,7 +358,7 @@ fn setup_hud(mut commands: Commands, channels: Res<RendererChannels>) {
                 menu.spawn((
                     Button,
                     Hovered::default(),
-                    RoomTypeButton(room_type),
+                    BuildOptionButton(BuildSelection::Room(room_type)),
                     Node {
                         width: percent(100),
                         height: px(34),
@@ -373,12 +380,49 @@ fn setup_hud(mut commands: Commands, channels: Res<RendererChannels>) {
                 .observe(
                     move |_activate: On<Activate>, mut placement: ResMut<PlacementState>| {
                         if !placement.request_pending {
-                            placement.selected_room = Some(room_type);
+                            placement.selected_build = Some(BuildSelection::Room(room_type));
                             placement.error = None;
                         }
                     },
                 );
             }
+
+            menu.spawn((
+                Text::new("BUILD STEPS"),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.63, 0.72, 0.83)),
+            ));
+
+            menu.spawn((
+                Button,
+                Hovered::default(),
+                BuildOptionButton(BuildSelection::Steps),
+                Node {
+                    width: percent(100),
+                    height: px(34),
+                    justify_content: JustifyContent::FlexStart,
+                    align_items: AlignItems::Center,
+                    padding: UiRect::horizontal(px(10)),
+                    border: UiRect::all(px(1)),
+                    border_radius: BorderRadius::all(px(5)),
+                    ..default()
+                },
+                BorderColor::all(Color::srgb(0.30, 0.38, 0.48)),
+                BackgroundColor(Color::srgba(0.15, 0.20, 0.28, 0.92)),
+                children![(
+                    Text::new("Steps ($5,000)"),
+                    TextFont::from_font_size(14.0),
+                    TextColor(Color::srgb(0.94, 0.96, 1.0)),
+                )],
+            ))
+            .observe(
+                move |_activate: On<Activate>, mut placement: ResMut<PlacementState>| {
+                    if !placement.request_pending {
+                        placement.selected_build = Some(BuildSelection::Steps);
+                        placement.error = None;
+                    }
+                },
+            );
         });
 
     // Keep placement failures visible without blocking the tower view.
@@ -586,7 +630,7 @@ fn update_placement_preview(
     mut placement: ResMut<PlacementState>,
     mut previews: Query<(&mut Sprite, &mut Transform, &mut Visibility), With<PlacementPreview>>,
 ) {
-    let Some(room_type) = placement.selected_room else {
+    let Some(build_selection) = placement.selected_build else {
         for (_, _, mut visibility) in &mut previews {
             *visibility = Visibility::Hidden;
         }
@@ -624,26 +668,42 @@ fn update_placement_preview(
         return;
     };
 
-    let room_size = room_dimensions(room_type);
+    let (build_size, build_color, build_position) = match build_selection {
+        BuildSelection::Room(room_type) => (
+            room_dimensions(room_type),
+            room_preview_color(room_type),
+            room_position(floor, column, room_type),
+        ),
+        BuildSelection::Steps => (
+            steps_dimensions(),
+            Color::srgba(0.78, 0.65, 0.40, 0.5),
+            steps_position(floor, column),
+        ),
+    };
     for (mut sprite, mut transform, mut visibility) in &mut previews {
-        sprite.color = room_preview_color(room_type);
-        sprite.custom_size = Some(room_size);
-        transform.translation = room_position(floor, column, room_type).extend(3.0);
+        sprite.color = build_color;
+        sprite.custom_size = Some(build_size);
+        transform.translation = build_position.extend(3.0);
         *visibility = Visibility::Visible;
     }
 
     if mouse.just_pressed(MouseButton::Left) && !placement.request_pending {
-        let message = RendererWorkerMessage::UiInput(UiInput::BuildRoom {
-            floor,
-            x: column,
-            room_type,
-        });
+        let message = match build_selection {
+            BuildSelection::Room(room_type) => RendererWorkerMessage::UiInput(UiInput::BuildRoom {
+                floor,
+                x: column,
+                room_type,
+            }),
+            BuildSelection::Steps => {
+                RendererWorkerMessage::UiInput(UiInput::BuildSteps { floor, x: column })
+            }
+        };
         placement.last_click_position = cursor_position;
         placement.error = None;
         match channels.to_worker.send(message) {
             Ok(()) => placement.request_pending = true,
             Err(error) => {
-                placement.error = Some(format!("Could not send room request: {error}"));
+                placement.error = Some(format!("Could not send build request: {error}"));
             }
         }
     }
@@ -679,6 +739,21 @@ fn room_dimensions(room_type: RoomType) -> Vec2 {
 /// Returns the center of a room's world-space footprint.
 fn room_position(floor: i32, x: u32, room_type: RoomType) -> Vec2 {
     let size = room_dimensions(room_type);
+    Vec2::new(
+        x as f32 * COLUMN_WIDTH + size.x * 0.5,
+        floor as f32 * FLOOR_HEIGHT + size.y * 0.5,
+    )
+}
+
+fn steps_dimensions() -> Vec2 {
+    Vec2::new(
+        crate::steps::Steps::WIDTH as f32 * COLUMN_WIDTH,
+        crate::steps::Steps::HEIGHT as f32 * FLOOR_HEIGHT - FLOOR_THICKNESS,
+    )
+}
+
+fn steps_position(floor: i32, x: u32) -> Vec2 {
+    let size = steps_dimensions();
     Vec2::new(
         x as f32 * COLUMN_WIDTH + size.x * 0.5,
         floor as f32 * FLOOR_HEIGHT + size.y * 0.5,
@@ -779,6 +854,15 @@ fn receive_updates(
                 placement.request_pending = false;
                 placement.error = Some(error);
             }
+            RendererWorkerMessage::StepsBuilt { id, floor, x } => {
+                spawn_steps(&mut commands, id, floor, x);
+                placement.request_pending = false;
+                placement.error = None;
+            }
+            RendererWorkerMessage::StepsBuildFailed { error } => {
+                placement.request_pending = false;
+                placement.error = Some(error);
+            }
             RendererWorkerMessage::FloorSegmentBuilt { floor, column } => {
                 spawn_floor_segment(&mut commands, floor, column);
             }
@@ -850,6 +934,19 @@ fn spawn_room(commands: &mut Commands, id: RoomId, floor: i32, x: u32, room_type
     ));
 }
 
+#[derive(Component)]
+struct StepsVisual {
+    _id: StepsId,
+}
+
+fn spawn_steps(commands: &mut Commands, id: StepsId, floor: i32, x: u32) {
+    commands.spawn((
+        Sprite::from_color(Color::srgb(0.78, 0.65, 0.40), steps_dimensions()),
+        Transform::from_translation(steps_position(floor, x).extend(2.5)),
+        StepsVisual { _id: id },
+    ));
+}
+
 /// Creates a single visible floor segment at its grid position.
 fn spawn_floor_segment(commands: &mut Commands, floor: i32, column: u32) {
     // A segment occupies one column and sits directly on its floor line.
@@ -899,13 +996,13 @@ fn update_room_button_appearance(
     mut buttons: Query<(
         &Hovered,
         Has<Pressed>,
-        &RoomTypeButton,
+        &BuildOptionButton,
         &mut BackgroundColor,
         &mut BorderColor,
     )>,
 ) {
     for (hovered, pressed, room_button, mut background, mut border) in &mut buttons {
-        let is_selected = placement.selected_room == Some(room_button.0);
+        let is_selected = placement.selected_build == Some(room_button.0);
         background.0 = if pressed {
             Color::srgb(0.25, 0.39, 0.56)
         } else if is_selected {

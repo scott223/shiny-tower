@@ -1,4 +1,5 @@
 use crate::room::{RoomId, RoomType};
+use crate::steps::StepsId;
 use std::sync::mpsc::Sender;
 
 /// Messages sent between the renderer and the worker handling UI requests.
@@ -16,6 +17,10 @@ pub enum RendererWorkerMessage {
     },
     /// Sent when a room build request could not be completed.
     RoomBuildFailed { error: String },
+    /// Sent by the worker after it successfully builds steps.
+    StepsBuilt { id: StepsId, floor: i32, x: u32 },
+    /// Sent when a steps build request could not be completed.
+    StepsBuildFailed { error: String },
     /// Sent by the worker after it successfully builds a floor segment.
     FloorSegmentBuilt { floor: i32, column: u32 },
     /// Sent by the worker after it successfully destroys a room.
@@ -36,6 +41,8 @@ pub enum UiInput {
         x: u32,
         room_type: RoomType,
     },
+    /// Request steps be built across the selected floor and the one above.
+    BuildSteps { floor: i32, x: u32 },
     /// Request a floor segment be built at a column.
     BuildFloorSegment { floor: i32, column: u32 },
     /// Request a room be destroyed by ID.

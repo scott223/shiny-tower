@@ -1,5 +1,6 @@
 use crate::elevator::{ElevatorId, ElevatorShaft};
 use crate::room::{Room, RoomId, RoomType};
+use crate::steps::{Steps, StepsId};
 use slotmap::SlotMap;
 
 /// Number of floors from ground level upward, including ground.
@@ -13,7 +14,7 @@ pub const FLOOR_SEGMENT_COST: u64 = 500;
 
 #[derive(Debug)]
 /// Building layout with floors numbered from `-FLOORS_BELOW_GROUND` through
-/// `FLOORS_ABOVE_GROUND - 1`, including rooms and elevator shafts.
+/// `FLOORS_ABOVE_GROUND - 1`, including rooms, elevator shafts, and steps.
 pub struct Tower {
     /// Floors in ascending numeric order.
     pub floors: Vec<Floor>,
@@ -21,6 +22,8 @@ pub struct Tower {
     pub rooms: SlotMap<RoomId, Room>,
     /// Elevator shafts indexed by their stable IDs.
     pub elevator_shafts: SlotMap<ElevatorId, ElevatorShaft>,
+    /// Steps indexed by their stable IDs.
+    pub steps: SlotMap<StepsId, Steps>,
 }
 
 /// Validated placement data used to price or commit a room build.
@@ -51,12 +54,18 @@ pub enum TowerError {
     ColumnOutOfRange(u32),
     /// A room footprint extends past the last column on its floor.
     RoomExceedsFloorWidth { x: u32, width: u32 },
+    /// Steps footprint extends past the last column on its floor.
+    StepsExceedsFloorWidth { x: u32, width: u32 },
+    /// Steps have no room or floor segment at this location.
+    StepsUnsupported { floor: i32, column: u32 },
     /// A required floor segment cannot be built below ground level.
     FloorSegmentBelowGround { floor: i32, column: u32 },
     /// A segment already occupies this floor and column.
     FloorSegmentAlreadyExists { floor: i32, column: u32 },
     /// No room or segment directly below supports this segment.
     FloorSegmentUnsupported { floor: i32, column: u32 },
+    /// An elevator has no room or floor segment at this floor and column.
+    ElevatorUnsupported { floor: i32, column: u32 },
     /// An elevator shaft already occupies this floor and column.
     FloorSegmentOverlapsElevator { floor: i32, column: u32 },
     /// Only a lobby may be placed on ground level; standalone segments are not allowed there.
@@ -67,6 +76,10 @@ pub enum TowerError {
     RoomOverlap(RoomId),
     /// The elevator's start floor is above its end floor.
     InvalidElevatorFloorRange { start_floor: i32, end_floor: i32 },
+    /// Steps would overlap an elevator shaft.
+    StepsOverlapElevator { column: u32, floor: i32 },
+    /// An elevator shaft would overlap steps.
+    ElevatorOverlapsSteps { column: u32, floor: i32 },
     /// The requested elevator shaft does not exist.
     ElevatorNotFound(ElevatorId),
     /// The requested room does not exist.
@@ -85,6 +98,7 @@ impl Default for Tower {
                 .collect(),
             rooms: SlotMap::with_key(),
             elevator_shafts: SlotMap::with_key(),
+            steps: SlotMap::with_key(),
         }
     }
 }
@@ -311,8 +325,8 @@ impl Tower {
     /// Builds an elevator shaft spanning the inclusive floor range.
     ///
     /// Fails if the range is reversed, either endpoint does not exist, the column is outside the
-    /// tower, or a standalone floor segment occupies its column on a spanned floor. Rooms may
-    /// overlap elevator shafts.
+    /// tower, any spanned floor has no room or floor segment at that column, or steps overlap the
+    /// shaft. Existing floors are required; building an elevator never adds floor segments.
     pub fn build_elevator_shaft(
         &mut self,
         column: u32,
@@ -339,15 +353,26 @@ impl Tower {
             }
         }
 
-        // A shaft reserves its column on every floor in the inclusive range.
+        if let Some(steps) = self.steps.values().find(|steps| {
+            let steps_end_floor = steps.start_floor + Steps::HEIGHT - 1;
+            steps.start_floor <= end_floor
+                && start_floor <= steps_end_floor
+                && u64::from(steps.x) <= u64::from(column)
+                && u64::from(column) < u64::from(steps.x + Steps::WIDTH)
+        }) {
+            return Err(TowerError::ElevatorOverlapsSteps {
+                column,
+                floor: start_floor.max(steps.start_floor),
+            });
+        }
+
+        // Require existing structure at the shaft column on every spanned floor.
         for floor in self
             .floors
             .iter()
             .filter(|floor| start_floor <= floor.number && floor.number <= end_floor)
         {
-            // Room construction adds floor segments for its footprint; those can coexist with
-            // shafts. Standalone segments still reserve their column against elevator shafts.
-            let segment_is_under_room = floor.rooms.iter().any(|room_id| {
+            let occupied_by_room = floor.rooms.iter().any(|room_id| {
                 let Some(room) = self.rooms.get(*room_id) else {
                     return false;
                 };
@@ -355,8 +380,8 @@ impl Tower {
                 let room_right = room_left + i64::from(room.room_type.properties().width);
                 room_left <= i64::from(column) && i64::from(column) < room_right
             });
-            if floor.floor_segments.contains(&column) && !segment_is_under_room {
-                return Err(TowerError::FloorSegmentOverlapsElevator {
+            if !floor.floor_segments.contains(&column) && !occupied_by_room {
+                return Err(TowerError::ElevatorUnsupported {
                     floor: floor.number,
                     column,
                 });
@@ -369,6 +394,67 @@ impl Tower {
             start_floor,
             end_floor,
         }))
+    }
+
+    /// Builds steps eight columns wide from `start_floor` through the floor above.
+    ///
+    /// The full footprint must already have rooms or floor segments on both floors. Steps may
+    /// overlap rooms but not an elevator shaft, and do not add floor segments.
+    pub fn build_steps(&mut self, x: u32, start_floor: i32) -> Result<StepsId, TowerError> {
+        let end_floor = start_floor
+            .checked_add(Steps::HEIGHT - 1)
+            .ok_or(TowerError::FloorNotFound(start_floor))?;
+        for floor_number in [start_floor, end_floor] {
+            if !self.floors.iter().any(|floor| floor.number == floor_number) {
+                return Err(TowerError::FloorNotFound(floor_number));
+            }
+        }
+
+        let right_edge = u64::from(x) + u64::from(Steps::WIDTH);
+        if right_edge > u64::from(MAX_FLOOR_WIDTH_COLUMNS) {
+            return Err(TowerError::StepsExceedsFloorWidth {
+                x,
+                width: Steps::WIDTH,
+            });
+        }
+
+        if let Some(elevator) = self.elevator_shafts.values().find(|elevator| {
+            elevator.start_floor <= end_floor
+                && start_floor <= elevator.end_floor
+                && u64::from(x) <= u64::from(elevator.column)
+                && u64::from(elevator.column) < right_edge
+        }) {
+            let floor = elevator.start_floor.max(start_floor);
+            return Err(TowerError::StepsOverlapElevator {
+                column: elevator.column,
+                floor,
+            });
+        }
+
+        for floor_number in start_floor..=end_floor {
+            let floor = self
+                .floors
+                .iter()
+                .find(|floor| floor.number == floor_number)
+                .expect("validated steps floors must exist");
+            for column in x..x + Steps::WIDTH {
+                let occupied_by_room = floor.rooms.iter().any(|room_id| {
+                    self.rooms.get(*room_id).is_some_and(|room| {
+                        room.x <= column
+                            && u64::from(column)
+                                < u64::from(room.x) + u64::from(room.room_type.properties().width)
+                    })
+                });
+                if !floor.floor_segments.contains(&column) && !occupied_by_room {
+                    return Err(TowerError::StepsUnsupported {
+                        floor: floor_number,
+                        column,
+                    });
+                }
+            }
+        }
+
+        Ok(self.steps.insert(Steps::new(x, start_floor)))
     }
 
     /// Removes and returns an elevator shaft, or errors if its ID is not in the slotmap.
@@ -650,12 +736,22 @@ mod tests {
     fn rooms_can_be_built_on_floors_spanned_by_an_elevator() {
         let mut tower = Tower::default();
         tower
-            .build_elevator_shaft(12, 0, 1)
-            .expect("elevator shaft should build across empty floors");
-        tower
             .build_room(0, 12, RoomType::Lobby)
-            .expect("ground-floor room should overlap the elevator shaft");
-        build_supported_segments(&mut tower, 1, 13..21);
+            .expect("ground-floor room should provide existing structure");
+        for column in 13..21 {
+            tower
+                .build_room(0, column, RoomType::Lobby)
+                .expect("ground-floor lobbies should provide support");
+            tower
+                .build_floor_segment(1, column)
+                .expect("ground-floor lobbies should support the upper floor");
+        }
+        tower
+            .build_floor_segment(1, 12)
+            .expect("existing lobby should support the shaft floor");
+        tower
+            .build_elevator_shaft(12, 0, 1)
+            .expect("elevator shaft should build through existing structure");
         tower
             .build_room(1, 12, RoomType::Office)
             .expect("upper-floor room should overlap the elevator shaft");
@@ -683,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn elevator_build_is_rejected_if_a_standalone_floor_segment_occupies_its_column() {
+    fn elevator_can_be_built_on_an_existing_standalone_floor_segment() {
         let mut tower = Tower::default();
         tower
             .build_room(0, 12, RoomType::Lobby)
@@ -692,13 +788,31 @@ mod tests {
             .build_floor_segment(1, 12)
             .expect("standalone segment should build above lobby");
 
-        assert!(matches!(
-            tower.build_elevator_shaft(12, 1, 1),
-            Err(TowerError::FloorSegmentOverlapsElevator {
+        assert!(tower.build_elevator_shaft(12, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn elevator_requires_existing_room_or_segment_on_every_spanned_floor() {
+        let mut tower = Tower::default();
+        tower
+            .build_room(0, 12, RoomType::Lobby)
+            .expect("ground-floor room should build");
+
+        assert_eq!(
+            tower.build_elevator_shaft(12, 0, 1),
+            Err(TowerError::ElevatorUnsupported {
                 floor: 1,
-                column: 12
+                column: 12,
             })
-        ));
+        );
+        assert!(tower.elevator_shafts.is_empty());
+
+        tower
+            .build_floor_segment(1, 12)
+            .expect("existing room should support the upper floor segment");
+        let segment_count = tower.floors[11].floor_segments.len();
+        assert!(tower.build_elevator_shaft(12, 0, 1).is_ok());
+        assert_eq!(tower.floors[11].floor_segments.len(), segment_count);
     }
 
     /// A room added to a floor can later be removed by its ID.
@@ -747,5 +861,150 @@ mod tests {
             tower.remove_room(room_id),
             Err(TowerError::RoomNotFound(missing_id)) if missing_id == room_id
         ));
+    }
+
+    #[test]
+    fn steps_span_two_floors_and_can_overlap_rooms_and_floor_segments() {
+        let mut tower = Tower::default();
+        build_supported_segments(&mut tower, 2, 0..16);
+        tower
+            .build_room(1, 0, RoomType::Condo)
+            .expect("steps may overlap a room on their lower floor");
+        tower
+            .build_room(2, 0, RoomType::Condo)
+            .expect("steps may overlap a room on their upper floor");
+
+        let steps_id = tower
+            .build_steps(4, 1)
+            .expect("steps should overlap rooms and floor segments");
+        let steps = tower.steps.get(steps_id).expect("steps should be stored");
+        assert_eq!((steps.x, steps.start_floor), (4, 1));
+        assert_eq!(Steps::WIDTH, 8);
+        assert_eq!(Steps::HEIGHT, 2);
+        assert_eq!(Steps::COST, 5_000);
+    }
+
+    #[test]
+    fn steps_cannot_overlap_an_elevator_on_either_spanned_floor() {
+        let mut tower = Tower::default();
+        build_supported_segments(&mut tower, 2, 0..24);
+        tower
+            .build_room(1, 0, RoomType::Condo)
+            .expect("room on lower step floor should build");
+        tower
+            .build_room(2, 0, RoomType::Condo)
+            .expect("room on upper step floor should build");
+        for floor in 3..=4 {
+            for column in 11..=12 {
+                tower
+                    .build_floor_segment(floor, column)
+                    .expect("existing structure should support the elevator");
+            }
+        }
+        tower
+            .build_elevator_shaft(11, 2, 4)
+            .expect("elevator should build");
+
+        assert_eq!(
+            tower.build_steps(4, 1),
+            Err(TowerError::StepsOverlapElevator {
+                column: 11,
+                floor: 2,
+            })
+        );
+        assert_eq!(
+            tower.build_steps(4, 3),
+            Err(TowerError::StepsOverlapElevator {
+                column: 11,
+                floor: 3,
+            })
+        );
+        assert!(tower.build_steps(4, 0).is_ok());
+        assert!(tower.build_steps(12, 1).is_ok());
+    }
+
+    #[test]
+    fn elevator_cannot_be_built_through_existing_steps() {
+        let mut tower = Tower::default();
+        build_supported_segments(&mut tower, 2, 0..16);
+        tower
+            .build_room(1, 0, RoomType::Condo)
+            .expect("room on lower step floor should build");
+        tower
+            .build_room(2, 0, RoomType::Condo)
+            .expect("room on upper step floor should build");
+        for floor in 3..=4 {
+            for column in 11..=12 {
+                tower
+                    .build_floor_segment(floor, column)
+                    .expect("existing structure should support the elevator");
+            }
+        }
+        tower.build_steps(4, 1).expect("steps should build");
+
+        assert_eq!(
+            tower.build_elevator_shaft(11, 2, 4),
+            Err(TowerError::ElevatorOverlapsSteps {
+                column: 11,
+                floor: 2,
+            })
+        );
+        assert!(tower.build_elevator_shaft(12, 2, 4).is_ok());
+    }
+
+    #[test]
+    fn steps_validate_floor_range_and_width() {
+        let mut tower = Tower::default();
+        build_supported_segments(
+            &mut tower,
+            2,
+            MAX_FLOOR_WIDTH_COLUMNS - Steps::WIDTH..MAX_FLOOR_WIDTH_COLUMNS,
+        );
+        assert_eq!(
+            tower.build_steps(0, FLOORS_ABOVE_GROUND - 1),
+            Err(TowerError::FloorNotFound(FLOORS_ABOVE_GROUND))
+        );
+        assert_eq!(
+            tower.build_steps(MAX_FLOOR_WIDTH_COLUMNS - Steps::WIDTH + 1, 1),
+            Err(TowerError::StepsExceedsFloorWidth {
+                x: MAX_FLOOR_WIDTH_COLUMNS - Steps::WIDTH + 1,
+                width: Steps::WIDTH,
+            })
+        );
+        assert!(
+            tower
+                .build_steps(MAX_FLOOR_WIDTH_COLUMNS - Steps::WIDTH, 1)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn steps_require_existing_rooms_or_segments_on_both_floors() {
+        let mut tower = Tower::default();
+        assert_eq!(
+            tower.build_steps(4, 1),
+            Err(TowerError::StepsUnsupported {
+                floor: 1,
+                column: 4,
+            })
+        );
+        assert!(tower.steps.is_empty());
+
+        build_supported_segments(&mut tower, 1, 4..12);
+        assert_eq!(
+            tower.build_steps(4, 1),
+            Err(TowerError::StepsUnsupported {
+                floor: 2,
+                column: 4,
+            })
+        );
+        assert!(tower.steps.is_empty());
+
+        for column in 4..12 {
+            tower
+                .build_floor_segment(2, column)
+                .expect("existing floor segments should provide upper-floor support");
+        }
+        assert!(tower.build_steps(4, 1).is_ok());
     }
 }

@@ -13,7 +13,11 @@ tick, time, day, quarter, year, and cash balance.
 Choose a room from the **Build Room** menu, then click a floor to place it. The
 selection stays active so you can keep building the same room type. A snapped,
 translucent room preview follows the cursor; rejected builds show an error
-tooltip beside the click.
+tooltip beside the click. The separate **Build Steps** category places steps
+across two floors for $5,000. Their full footprint must already have rooms or
+floor segments on both floors; steps may overlap rooms but not elevator shafts.
+Elevator shafts also require an existing room or floor segment at their column on
+every spanned floor, and neither structure creates floor segments automatically.
 
 ## Headless checks
 

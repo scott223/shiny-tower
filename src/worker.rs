@@ -1,5 +1,6 @@
 use crate::GameState;
 use crate::messages::{RendererWorkerMessage, SimulationSpeed, UiInput, send_message};
+use crate::steps::Steps;
 use crate::tower::FLOOR_SEGMENT_COST;
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -85,6 +86,53 @@ pub fn run(
                     ),
                 }
             }
+            RendererWorkerMessage::UiInput(UiInput::BuildSteps { floor, x }) => {
+                let build_result = match game_state.lock() {
+                    Ok(mut state) => {
+                        if state.economy.cash < Steps::COST {
+                            let error = format!(
+                                "Not enough cash: need ${}, have ${}",
+                                Steps::COST,
+                                state.economy.cash
+                            );
+                            eprintln!(
+                                "insufficient cash to build steps: need {}, have {}",
+                                Steps::COST,
+                                state.economy.cash
+                            );
+                            Err(error)
+                        } else {
+                            match state.building.build_steps(x, floor) {
+                                Ok(id) => {
+                                    state.economy.cash -= Steps::COST;
+                                    Ok(RendererWorkerMessage::StepsBuilt { id, floor, x })
+                                }
+                                Err(error) => {
+                                    eprintln!("could not build steps: {error:?}");
+                                    Err(format!("Could not build steps: {error:?}"))
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("game state lock poisoned: {error}");
+                        send_message(
+                            &to_renderer,
+                            RendererWorkerMessage::StepsBuildFailed {
+                                error: format!("Game state is unavailable: {error}"),
+                            },
+                        );
+                        break;
+                    }
+                };
+                match build_result {
+                    Ok(message) => send_message(&to_renderer, message),
+                    Err(error) => send_message(
+                        &to_renderer,
+                        RendererWorkerMessage::StepsBuildFailed { error },
+                    ),
+                }
+            }
             RendererWorkerMessage::UiInput(UiInput::BuildFloorSegment { floor, column }) => {
                 // Standalone floor segments have a fixed cost; validate funds before asking the
                 // tower to apply its placement and support rules.
@@ -143,6 +191,8 @@ pub fn run(
             }
             RendererWorkerMessage::RoomBuilt { .. }
             | RendererWorkerMessage::RoomBuildFailed { .. }
+            | RendererWorkerMessage::StepsBuilt { .. }
+            | RendererWorkerMessage::StepsBuildFailed { .. }
             | RendererWorkerMessage::FloorSegmentBuilt { .. }
             | RendererWorkerMessage::RoomRemoved(_) => {
                 // These variants are worker outputs, so receiving them here indicates a
@@ -209,6 +259,64 @@ mod tests {
         assert_eq!(speed_receiver.recv().unwrap(), SimulationSpeed::ThreeX);
         assert!(matches!(
             output_receiver.recv().unwrap(),
+            RendererWorkerMessage::Shutdown
+        ));
+    }
+
+    #[test]
+    fn building_steps_costs_five_thousand() {
+        let mut building = Tower::default();
+        for column in 8..16 {
+            building
+                .build_room(0, column, crate::room::RoomType::Lobby)
+                .expect("ground-floor lobby should build");
+            building
+                .build_floor_segment(1, column)
+                .expect("lobby should support first-floor segment");
+            building
+                .build_floor_segment(2, column)
+                .expect("first-floor segment should support second-floor segment");
+        }
+        let state = Arc::new(Mutex::new(GameState {
+            building,
+            economy: crate::economy::Economy {
+                cash: 5_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let output = run_worker_request(Arc::clone(&state), UiInput::BuildSteps { floor: 1, x: 8 });
+
+        assert_eq!(state.lock().unwrap().economy.cash, 0);
+        assert!(matches!(
+            output.recv().unwrap(),
+            RendererWorkerMessage::StepsBuilt { floor: 1, x: 8, .. }
+        ));
+        assert!(matches!(
+            output.recv().unwrap(),
+            RendererWorkerMessage::Shutdown
+        ));
+    }
+
+    #[test]
+    fn steps_build_with_insufficient_cash_does_not_change_state() {
+        let state = Arc::new(Mutex::new(GameState {
+            economy: crate::economy::Economy {
+                cash: 4_999,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let output = run_worker_request(Arc::clone(&state), UiInput::BuildSteps { floor: 1, x: 8 });
+
+        assert_eq!(state.lock().unwrap().economy.cash, 4_999);
+        assert!(matches!(
+            output.recv().unwrap(),
+            RendererWorkerMessage::StepsBuildFailed { error }
+                if error.contains("need $5000, have $4999")
+        ));
+        assert!(matches!(
+            output.recv().unwrap(),
             RendererWorkerMessage::Shutdown
         ));
     }

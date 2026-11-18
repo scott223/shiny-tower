@@ -5,6 +5,7 @@ pub mod people;
 pub mod room;
 pub mod runtime;
 pub mod simulation;
+pub mod steps;
 pub mod tower;
 pub mod worker;
 
