@@ -1,9 +1,16 @@
-use crate::{GameState, renderer, simulation, worker};
+use crate::messages::{RendererWorkerMessage, SimulationRendererMessage};
+use crate::{GameState, simulation, worker};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-/// Creates the shared state and communication channels, then starts the threads.
-pub fn run() {
+/// Creates shared state and channels, starts the worker threads, then calls the renderer.
+pub fn run(
+    render: impl FnOnce(
+        mpsc::Sender<RendererWorkerMessage>,
+        mpsc::Receiver<RendererWorkerMessage>,
+        mpsc::Receiver<SimulationRendererMessage>,
+    ),
+) {
     // Both state-mutating threads share the same state behind a mutex.
     let game_state = Arc::new(Mutex::new(GameState::default()));
     // Keep UI input, worker output, and simulation ticks on separate channels.
@@ -36,7 +43,7 @@ pub fn run() {
     });
 
     // Bevy's window event loop must run on the main thread on macOS.
-    renderer::run(
+    render(
         renderer_to_worker_sender,
         worker_to_renderer_receiver,
         simulation_to_renderer_receiver,

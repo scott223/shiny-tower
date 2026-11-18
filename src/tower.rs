@@ -65,12 +65,8 @@ pub enum TowerError {
     LobbyOnlyAllowedOnEveryFifteenthFloor { floor: i32 },
     /// The proposed room footprint intersects an existing room.
     RoomOverlap(RoomId),
-    /// An elevator shaft already occupies the requested column on this floor.
-    ElevatorOverlap { column: u32 },
     /// The elevator's start floor is above its end floor.
     InvalidElevatorFloorRange { start_floor: i32, end_floor: i32 },
-    /// The elevator shaft would intersect an existing room.
-    ElevatorOverlapsRoom { room_id: RoomId, floor: i32 },
     /// The requested elevator shaft does not exist.
     ElevatorNotFound(ElevatorId),
     /// The requested room does not exist.
@@ -226,18 +222,6 @@ impl Tower {
             return Err(TowerError::RoomExceedsFloorWidth { x, width });
         }
 
-        // Reject any footprint that contains a shaft's column on this floor.
-        if let Some(elevator) = self.elevator_shafts.values().find(|elevator| {
-            elevator.start_floor <= floor_number
-                && floor_number <= elevator.end_floor
-                && i64::from(x) <= i64::from(elevator.column)
-                && i64::from(elevator.column) < right_edge
-        }) {
-            return Err(TowerError::ElevatorOverlap {
-                column: elevator.column,
-            });
-        }
-
         // Plan segments for the whole room footprint. Ground-floor lobby segments need no support
         // below; segments on higher floors require a room or segment directly underneath.
         let mut missing_segments = Vec::new();
@@ -305,8 +289,8 @@ impl Tower {
     ///
     /// Only lobbies may be placed on ground level, and lobbies are restricted to ground level and
     /// positive multiples of 15. Missing floor segments are added automatically; segments above
-    /// ground must have support below. The build fails if the room exceeds the floor width,
-    /// overlaps another room, or overlaps an elevator shaft.
+    /// ground must have support below. The build fails if the room exceeds the floor width or
+    /// overlaps another room. Rooms may overlap elevator shafts.
     pub fn build_room(
         &mut self,
         floor_number: i32,
@@ -327,7 +311,8 @@ impl Tower {
     /// Builds an elevator shaft spanning the inclusive floor range.
     ///
     /// Fails if the range is reversed, either endpoint does not exist, the column is outside the
-    /// tower, or an existing room or floor segment occupies its column on a spanned floor.
+    /// tower, or a standalone floor segment occupies its column on a spanned floor. Rooms may
+    /// overlap elevator shafts.
     pub fn build_elevator_shaft(
         &mut self,
         column: u32,
@@ -360,23 +345,17 @@ impl Tower {
             .iter()
             .filter(|floor| start_floor <= floor.number && floor.number <= end_floor)
         {
-            // A room conflicts if its horizontal footprint contains the shaft column.
-            for room_id in &floor.rooms {
+            // Room construction adds floor segments for its footprint; those can coexist with
+            // shafts. Standalone segments still reserve their column against elevator shafts.
+            let segment_is_under_room = floor.rooms.iter().any(|room_id| {
                 let Some(room) = self.rooms.get(*room_id) else {
-                    continue;
+                    return false;
                 };
                 let room_left = i64::from(room.x);
                 let room_right = room_left + i64::from(room.room_type.properties().width);
-                if room_left <= i64::from(column) && i64::from(column) < room_right {
-                    return Err(TowerError::ElevatorOverlapsRoom {
-                        room_id: *room_id,
-                        floor: floor.number,
-                    });
-                }
-            }
-
-            // Floor segments also occupy columns, so the shaft cannot pass through one.
-            if floor.floor_segments.contains(&column) {
+                room_left <= i64::from(column) && i64::from(column) < room_right
+            });
+            if floor.floor_segments.contains(&column) && !segment_is_under_room {
                 return Err(TowerError::FloorSegmentOverlapsElevator {
                     floor: floor.number,
                     column,
@@ -668,59 +647,57 @@ mod tests {
     }
 
     #[test]
-    fn room_build_is_rejected_if_it_overlaps_an_elevator_on_that_floor() {
+    fn rooms_can_be_built_on_floors_spanned_by_an_elevator() {
         let mut tower = Tower::default();
-        let elevator_id = tower
-            .build_elevator_shaft(12, -1, 1)
+        tower
+            .build_elevator_shaft(12, 0, 1)
             .expect("elevator shaft should build across empty floors");
+        tower
+            .build_room(0, 12, RoomType::Lobby)
+            .expect("ground-floor room should overlap the elevator shaft");
+        build_supported_segments(&mut tower, 1, 13..21);
+        tower
+            .build_room(1, 12, RoomType::Office)
+            .expect("upper-floor room should overlap the elevator shaft");
+
+        assert!(
+            tower
+                .floors
+                .iter()
+                .find(|floor| floor.number == 1)
+                .expect("first floor should exist")
+                .floor_segments
+                .contains(&12)
+        );
+    }
+
+    #[test]
+    fn elevator_can_be_built_through_a_room_and_its_floor_segments() {
+        let mut tower = Tower::default();
+        build_supported_segments(&mut tower, 1, 10..26);
+        tower
+            .build_room(1, 10, RoomType::Condo)
+            .expect("room should build");
+
+        assert!(tower.build_elevator_shaft(12, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn elevator_build_is_rejected_if_a_standalone_floor_segment_occupies_its_column() {
+        let mut tower = Tower::default();
+        tower
+            .build_room(0, 12, RoomType::Lobby)
+            .expect("lobby should provide support");
+        tower
+            .build_floor_segment(1, 12)
+            .expect("standalone segment should build above lobby");
 
         assert!(matches!(
-            tower.build_floor_segment(1, 12),
+            tower.build_elevator_shaft(12, 1, 1),
             Err(TowerError::FloorSegmentOverlapsElevator {
                 floor: 1,
                 column: 12
             })
-        ));
-        for floor in [-1, 0, 1] {
-            assert!(matches!(
-                tower.build_room(
-                    floor,
-                    12,
-                    match floor {
-                        -1 => RoomType::Condo,
-                        0 => RoomType::Lobby,
-                        _ => RoomType::Office,
-                    }
-                ),
-                Err(TowerError::ElevatorOverlap { column: 12 })
-            ));
-        }
-        build_supported_segments(&mut tower, 2, 13..22);
-        assert!(tower.build_room(2, 13, RoomType::Office).is_ok());
-        tower
-            .remove_elevator_shaft(elevator_id)
-            .expect("elevator shaft should be removable by its ID");
-        assert!(tower.build_room(0, 12, RoomType::Lobby).is_ok());
-        assert!(matches!(
-            tower.remove_elevator_shaft(elevator_id),
-            Err(TowerError::ElevatorNotFound(missing_id)) if missing_id == elevator_id
-        ));
-    }
-
-    #[test]
-    fn elevator_build_is_rejected_if_a_room_occupies_its_column() {
-        let mut tower = Tower::default();
-        build_supported_segments(&mut tower, 1, 10..26);
-        let room_id = tower
-            .build_room(1, 10, RoomType::Condo)
-            .expect("room should build");
-
-        assert!(matches!(
-            tower.build_elevator_shaft(12, 1, 1),
-            Err(TowerError::ElevatorOverlapsRoom {
-                room_id: overlapping_id,
-                floor: 1
-            }) if overlapping_id == room_id
         ));
     }
 

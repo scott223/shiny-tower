@@ -12,6 +12,7 @@ use std::time::Duration;
 /// Simulation tick cadence, independent of how quickly the renderer draws frames.
 const TICK_INTERVAL: Duration = Duration::from_millis(60);
 const TICKS_PER_DAY: u64 = 2_600;
+const DAILY_PROFIT_TICK: u64 = 160;
 const DAYS_PER_QUARTER: u64 = 3;
 const DAYS_PER_YEAR: u64 = 12;
 const TICKS_PER_QUARTER: u64 = TICKS_PER_DAY * DAYS_PER_QUARTER;
@@ -31,7 +32,7 @@ const DAY_SCHEDULE: [(u64, u64, u64, u64, TimeOfDayPeriod); 7] = [
 ];
 
 #[derive(Debug, PartialEq, Eq)]
-enum QuarterlyProfitError {
+enum RoomProfitError {
     TotalOverflow,
     CashOverflow,
 }
@@ -82,11 +83,14 @@ fn tick_interval(speed: SimulationSpeed) -> Option<Duration> {
     }
 }
 
-fn apply_quarterly_room_profit(
+fn apply_room_profit(
     state: &mut GameState,
     tick: u64,
-) -> Result<(), QuarterlyProfitError> {
-    if tick == 0 || tick % TICKS_PER_QUARTER != 0 {
+    period_ticks: u64,
+    payout_tick: u64,
+    profit_for_room: impl Fn(crate::room::RoomType) -> u64,
+) -> Result<(), RoomProfitError> {
+    if tick == 0 || tick % period_ticks != payout_tick {
         return Ok(());
     }
 
@@ -95,17 +99,29 @@ fn apply_quarterly_room_profit(
         .rooms
         .values()
         .try_fold(0_u64, |total, room| {
-            total.checked_add(room.room_type.properties().profit_quarterly)
+            total.checked_add(profit_for_room(room.room_type))
         })
-        .ok_or(QuarterlyProfitError::TotalOverflow)?;
+        .ok_or(RoomProfitError::TotalOverflow)?;
     let updated_cash = state
         .economy
         .cash
         .checked_add(total_profit)
-        .ok_or(QuarterlyProfitError::CashOverflow)?;
+        .ok_or(RoomProfitError::CashOverflow)?;
 
     state.economy.cash = updated_cash;
     Ok(())
+}
+
+fn apply_daily_room_profit(state: &mut GameState, tick: u64) -> Result<(), RoomProfitError> {
+    apply_room_profit(state, tick, TICKS_PER_DAY, DAILY_PROFIT_TICK, |room_type| {
+        room_type.properties().profit_daily
+    })
+}
+
+fn apply_quarterly_room_profit(state: &mut GameState, tick: u64) -> Result<(), RoomProfitError> {
+    apply_room_profit(state, tick, TICKS_PER_QUARTER, 0, |room_type| {
+        room_type.properties().profit_quarterly
+    })
 }
 
 /// Advances the shared simulation tick and publishes each tick to the renderer.
@@ -139,19 +155,28 @@ pub fn run(
 
         // Saturation keeps the counter from wrapping back to zero after u64::MAX ticks.
         // Release the state lock before publishing so a slow renderer cannot block state access.
-        let (tick, cash, profit_result) = match game_state.lock() {
+        let (tick, cash, daily_profit_result, quarterly_profit_result) = match game_state.lock() {
             Ok(mut state) => {
                 state.simulation_tick = state.simulation_tick.saturating_add(1);
                 let tick = state.simulation_tick;
-                let profit_result = apply_quarterly_room_profit(&mut state, tick);
-                (tick, state.economy.cash, profit_result)
+                let daily_profit_result = apply_daily_room_profit(&mut state, tick);
+                let quarterly_profit_result = apply_quarterly_room_profit(&mut state, tick);
+                (
+                    tick,
+                    state.economy.cash,
+                    daily_profit_result,
+                    quarterly_profit_result,
+                )
             }
             Err(error) => {
                 eprintln!("game state lock poisoned: {error}");
                 break;
             }
         };
-        if let Err(error) = profit_result {
+        if let Err(error) = daily_profit_result {
+            eprintln!("could not apply daily room profit: {error:?}");
+        }
+        if let Err(error) = quarterly_profit_result {
             eprintln!("could not apply quarterly room profit: {error:?}");
         }
         send_message(
@@ -344,6 +369,43 @@ mod tests {
     }
 
     #[test]
+    fn daily_room_profits_are_credited_at_nine_each_day() {
+        let mut state = GameState::default();
+        state
+            .building
+            .rooms
+            .insert(crate::room::Room::new(0, crate::room::RoomType::FastFood));
+        let initial_cash = state.economy.cash;
+
+        let payout_time = time_of_day(DAILY_PROFIT_TICK);
+        assert_eq!((payout_time.hour, payout_time.minute), (9, 0));
+        apply_daily_room_profit(&mut state, DAILY_PROFIT_TICK - 1)
+            .expect("profit should not be paid before 09:00");
+        assert_eq!(state.economy.cash, initial_cash);
+
+        apply_daily_room_profit(&mut state, DAILY_PROFIT_TICK)
+            .expect("daily profit should be paid at 09:00");
+        assert_eq!(
+            state.economy.cash,
+            initial_cash + crate::room::RoomType::FastFood.properties().profit_daily
+        );
+
+        apply_daily_room_profit(&mut state, DAILY_PROFIT_TICK + 1)
+            .expect("profit should not be paid again on the same day");
+        assert_eq!(
+            state.economy.cash,
+            initial_cash + crate::room::RoomType::FastFood.properties().profit_daily
+        );
+
+        apply_daily_room_profit(&mut state, DAILY_PROFIT_TICK + TICKS_PER_DAY)
+            .expect("daily profit should be paid the next day");
+        assert_eq!(
+            state.economy.cash,
+            initial_cash + 2 * crate::room::RoomType::FastFood.properties().profit_daily
+        );
+    }
+
+    #[test]
     fn quarterly_profit_overflow_does_not_change_cash() {
         let mut state = GameState::default();
         state.economy.cash = u64::MAX;
@@ -354,7 +416,23 @@ mod tests {
 
         assert_eq!(
             apply_quarterly_room_profit(&mut state, TICKS_PER_QUARTER),
-            Err(QuarterlyProfitError::CashOverflow)
+            Err(RoomProfitError::CashOverflow)
+        );
+        assert_eq!(state.economy.cash, u64::MAX);
+    }
+
+    #[test]
+    fn daily_profit_overflow_does_not_change_cash() {
+        let mut state = GameState::default();
+        state.economy.cash = u64::MAX;
+        state
+            .building
+            .rooms
+            .insert(crate::room::Room::new(0, crate::room::RoomType::FastFood));
+
+        assert_eq!(
+            apply_daily_room_profit(&mut state, DAILY_PROFIT_TICK),
+            Err(RoomProfitError::CashOverflow)
         );
         assert_eq!(state.economy.cash, u64::MAX);
     }

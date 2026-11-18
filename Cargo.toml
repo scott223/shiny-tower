@@ -3,6 +3,19 @@ name = "shiny-tower"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["renderer"]
+renderer = ["dep:bevy"]
+headless = []
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "shiny-tower"
+path = "src/main.rs"
+required-features = ["renderer"]
+
 [dependencies]
 slotmap = "1.0"
-bevy = { version = "0.20.1", features = ["dynamic_linking"] }
+bevy = { version = "0.20.1", features = ["dynamic_linking"], optional = true }

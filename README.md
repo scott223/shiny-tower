@@ -14,3 +14,16 @@ Choose a room from the **Build Room** menu, then click a floor to place it. The
 selection stays active so you can keep building the same room type. A snapped,
 translucent room preview follows the cursor; rejected builds show an error
 tooltip beside the click.
+
+## Headless checks
+
+The tower, simulation, worker, and runtime orchestration can be tested without
+building Bevy or the renderer:
+
+```sh
+cargo test --lib --no-default-features --features headless
+```
+
+This compiles the headless library and runs tests for the tower, economy,
+simulation, worker, and their supporting modules. The normal application keeps
+the renderer enabled by default.

@@ -36,7 +36,7 @@ const HUD_HEIGHT: f32 = 78.0;
 const ROOM_MENU_LEFT: f32 = 12.0;
 const ROOM_MENU_TOP: f32 = 90.0;
 const ROOM_MENU_WIDTH: f32 = 190.0;
-const ROOM_MENU_HEIGHT: f32 = 220.0;
+const ROOM_MENU_HEIGHT: f32 = 320.0;
 const ERROR_TOOLTIP_WIDTH: f32 = 300.0;
 const ERROR_TOOLTIP_HEIGHT: f32 = 72.0;
 
@@ -344,6 +344,9 @@ fn setup_hud(mut commands: Commands, channels: Res<RendererChannels>) {
                 ("Party Hall", RoomType::PartyHall),
                 ("Lobby", RoomType::Lobby),
                 ("Office", RoomType::Office),
+                ("Fast Food", RoomType::FastFood),
+                ("Retail Shop", RoomType::RetailShop),
+                ("Restaurant", RoomType::Restaurant),
             ] {
                 menu.spawn((
                     Button,
@@ -870,6 +873,9 @@ fn room_color(room_type: RoomType) -> Color {
         RoomType::PartyHall => Color::srgb(0.69, 0.42, 0.82),
         RoomType::Lobby => Color::srgb(0.91, 0.68, 0.29),
         RoomType::Office => Color::srgb(0.36, 0.73, 0.55),
+        RoomType::FastFood => Color::srgb(0.91, 0.36, 0.24),
+        RoomType::RetailShop => Color::srgb(0.88, 0.48, 0.72),
+        RoomType::Restaurant => Color::srgb(0.78, 0.34, 0.22),
     }
 }
 
@@ -880,6 +886,9 @@ fn room_preview_color(room_type: RoomType) -> Color {
         RoomType::PartyHall => (0.69, 0.42, 0.82),
         RoomType::Lobby => (0.91, 0.68, 0.29),
         RoomType::Office => (0.36, 0.73, 0.55),
+        RoomType::FastFood => (0.91, 0.36, 0.24),
+        RoomType::RetailShop => (0.88, 0.48, 0.72),
+        RoomType::Restaurant => (0.78, 0.34, 0.22),
     };
     Color::srgba(red, green, blue, 0.36)
 }
